@@ -1,0 +1,2200 @@
+use crate::app_core::remove_path;
+use crate::database::{database_path_key, PathColumn};
+use crate::managed_state::{
+    content_fingerprint, fingerprint_matches, is_managed_by_state, managed_state_entry,
+    read_managed_state, unmark_managed_skill, ManagedSkillState, ManagedStateCheckpoint,
+};
+use crate::skill_install_source::{is_git_install_source, parse_git_install_spec};
+use crate::skill_model::SkillDescriptor;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct ManagedInstallation {
+    pub path: PathBuf,
+    pub skill: SkillDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRoot {
+    pub path: PathBuf,
+    pub scope: String,
+    pub project_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OriginMetadataRow {
+    origin_kind: String,
+    origin_locator: String,
+    resolved_locator: String,
+    tracking_ref: String,
+    installed_ref: String,
+    latest_ref: String,
+    sync_state: String,
+    sync_message: String,
+    lag_count: i64,
+    last_probe_at: Option<i64>,
+    last_sync_at: Option<i64>,
+    managed_by_app: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedInstallationRow {
+    assistant: String,
+    source: String,
+    source_kind: String,
+    target_name: String,
+    scope: String,
+    install_mode: String,
+    project_path: Option<String>,
+    tracking_ref: Option<String>,
+    subdir: Option<String>,
+    resolved_ref: Option<String>,
+    content_hash: Option<String>,
+    installed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkillTagsRow {
+    tags: Option<String>,
+    tags_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LibrarySkillRow {
+    id: String,
+    name: String,
+    source: String,
+    source_kind: String,
+    resolved_ref: Option<String>,
+    content_hash: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkillDeploymentRow {
+    skill_id: String,
+    library_path: String,
+    assistant: String,
+    scope: String,
+    project_path: Option<String>,
+    deploy_mode: String,
+    deployed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PathMetadataCheckpoint {
+    path: PathBuf,
+    origin: Option<OriginMetadataRow>,
+    installation: Option<ManagedInstallationRow>,
+    tags: Option<SkillTagsRow>,
+    #[serde(default)]
+    library_skill: Option<LibrarySkillRow>,
+    #[serde(default)]
+    deployment: Option<SkillDeploymentRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedRootRow {
+    scope: String,
+    project_path: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedRootCheckpoint {
+    path: PathBuf,
+    row: Option<ManagedRootRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScenarioReferenceCheckpoint {
+    id: String,
+    skill_ids: Option<String>,
+    skill_ids_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedMetadataCheckpoint {
+    paths: Vec<PathMetadataCheckpoint>,
+    roots: Vec<(PathBuf, ManagedStateCheckpoint)>,
+    #[serde(default)]
+    managed_roots: Vec<ManagedRootCheckpoint>,
+    #[serde(default)]
+    scenario_references: Vec<ScenarioReferenceCheckpoint>,
+}
+
+impl ManagedMetadataCheckpoint {
+    pub fn capture(db: &Connection, paths: &[PathBuf]) -> Result<Self, String> {
+        let mut unique_paths = paths.to_vec();
+        unique_paths.sort();
+        unique_paths.dedup();
+        let mut root_paths = unique_paths
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        root_paths.sort();
+        root_paths.dedup();
+        let roots = root_paths
+            .iter()
+            .map(|root| ManagedStateCheckpoint::capture(root).map(|state| (root.clone(), state)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let managed_roots = root_paths
+            .into_iter()
+            .map(|root| capture_managed_root(db, root))
+            .collect::<Result<Vec<_>, _>>()?;
+        let paths = unique_paths
+            .into_iter()
+            .map(|path| capture_path_metadata(db, path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            paths,
+            roots,
+            managed_roots,
+            scenario_references: Vec::new(),
+        })
+    }
+
+    pub(crate) fn capture_with_scenario_references(
+        db: &Connection,
+        paths: &[PathBuf],
+    ) -> Result<Self, String> {
+        let mut checkpoint = Self::capture(db, paths)?;
+        checkpoint.scenario_references = capture_scenario_references(db, paths)?;
+        Ok(checkpoint)
+    }
+
+    pub fn restore(&self, db: &Connection) -> Result<(), String> {
+        let transaction = db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for checkpoint in &self.paths {
+            clear_deployment_metadata(&transaction, checkpoint)?;
+        }
+        for checkpoint in &self.paths {
+            clear_library_skill_metadata(&transaction, checkpoint)?;
+        }
+        for checkpoint in &self.paths {
+            restore_path_metadata(&transaction, checkpoint)?;
+        }
+        for checkpoint in &self.paths {
+            restore_library_skill_metadata(&transaction, checkpoint)?;
+        }
+        for checkpoint in &self.paths {
+            restore_deployment_metadata(&transaction, checkpoint)?;
+        }
+        for checkpoint in &self.managed_roots {
+            restore_managed_root(&transaction, checkpoint)?;
+        }
+        for checkpoint in &self.scenario_references {
+            transaction
+                .execute(
+                    "UPDATE scenarios SET skill_ids = ?, skill_ids_json = ? WHERE id = ?",
+                    params![
+                        checkpoint.skill_ids,
+                        checkpoint.skill_ids_json,
+                        checkpoint.id
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+
+        let mut errors = Vec::new();
+        for (root, state) in &self.roots {
+            if let Err(error) = state.restore(root) {
+                errors.push(format!("{}: {}", root.to_string_lossy(), error));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("恢复受管状态失败: {}", errors.join("；")))
+        }
+    }
+
+    pub(crate) fn sidecar_paths(&self) -> Vec<PathBuf> {
+        self.roots
+            .iter()
+            .map(|(root, _)| root.join(crate::managed_state::STATE_FILE_NAME))
+            .collect()
+    }
+}
+
+fn capture_scenario_references(
+    db: &Connection,
+    paths: &[PathBuf],
+) -> Result<Vec<ScenarioReferenceCheckpoint>, String> {
+    if !table_exists(db, "scenarios")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = db
+        .prepare("SELECT id, skill_ids, skill_ids_json FROM scenarios ORDER BY id")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ScenarioReferenceCheckpoint {
+                id: row.get(0)?,
+                skill_ids: row.get(1)?,
+                skill_ids_json: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    let mut checkpoints = Vec::new();
+    for row in rows {
+        let row = row.map_err(|error| error.to_string())?;
+        let mut references: Vec<String> = serde_json::from_str(&row.skill_ids_json)
+            .map_err(|error| format!("场景 {} 的 skill_ids_json 损坏: {}", row.id, error))?;
+        if references.is_empty() {
+            references =
+                crate::database::parse_legacy_list(row.skill_ids.as_deref().unwrap_or_default());
+        }
+        if references.iter().any(|reference| {
+            paths.iter().any(|path| {
+                if cfg!(windows) {
+                    reference
+                        .replace('/', "\\")
+                        .eq_ignore_ascii_case(&path.to_string_lossy().replace('/', "\\"))
+                } else {
+                    Path::new(reference) == path
+                }
+            })
+        }) {
+            checkpoints.push(row);
+        }
+    }
+    Ok(checkpoints)
+}
+
+fn capture_managed_root(db: &Connection, path: PathBuf) -> Result<ManagedRootCheckpoint, String> {
+    let key = database_path_key(db, PathColumn::ManagedRoot, &path)?;
+    let row = db
+        .query_row(
+            "SELECT scope, project_path, updated_at FROM managed_roots WHERE root_path = ?",
+            [&key],
+            |row| {
+                Ok(ManagedRootRow {
+                    scope: row.get(0)?,
+                    project_path: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(ManagedRootCheckpoint { path, row })
+}
+
+fn restore_managed_root(db: &Connection, checkpoint: &ManagedRootCheckpoint) -> Result<(), String> {
+    let key = database_path_key(db, PathColumn::ManagedRoot, &checkpoint.path)?;
+    db.execute("DELETE FROM managed_roots WHERE root_path = ?", [&key])
+        .map_err(|error| error.to_string())?;
+    if let Some(row) = &checkpoint.row {
+        db.execute(
+            "INSERT INTO managed_roots (root_path, scope, project_path, updated_at)
+             VALUES (?, ?, ?, ?)",
+            params![&key, &row.scope, &row.project_path, &row.updated_at],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn capture_path_metadata(db: &Connection, path: PathBuf) -> Result<PathMetadataCheckpoint, String> {
+    let origin_key = database_path_key(db, PathColumn::SkillOrigin, &path)?;
+    let origin = db
+        .query_row(
+            "SELECT origin_kind, origin_locator, resolved_locator, tracking_ref, installed_ref,
+                    latest_ref, sync_state, sync_message, lag_count, last_probe_at, last_sync_at,
+                    managed_by_app
+             FROM skill_origin_meta WHERE skill_path = ?",
+            [&origin_key],
+            |row| {
+                Ok(OriginMetadataRow {
+                    origin_kind: row.get(0)?,
+                    origin_locator: row.get(1)?,
+                    resolved_locator: row.get(2)?,
+                    tracking_ref: row.get(3)?,
+                    installed_ref: row.get(4)?,
+                    latest_ref: row.get(5)?,
+                    sync_state: row.get(6)?,
+                    sync_message: row.get(7)?,
+                    lag_count: row.get(8)?,
+                    last_probe_at: row.get(9)?,
+                    last_sync_at: row.get(10)?,
+                    managed_by_app: row.get(11)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let installation_key = database_path_key(db, PathColumn::ManagedInstallation, &path)?;
+    let installation = db
+        .query_row(
+            "SELECT assistant, source, source_kind, target_name, scope, install_mode,
+                    project_path, tracking_ref, subdir, resolved_ref, content_hash, installed_at
+             FROM managed_installations WHERE skill_path = ?",
+            [&installation_key],
+            |row| {
+                Ok(ManagedInstallationRow {
+                    assistant: row.get(0)?,
+                    source: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    target_name: row.get(3)?,
+                    scope: row.get(4)?,
+                    install_mode: row.get(5)?,
+                    project_path: row.get(6)?,
+                    tracking_ref: row.get(7)?,
+                    subdir: row.get(8)?,
+                    resolved_ref: row.get(9)?,
+                    content_hash: row.get(10)?,
+                    installed_at: row.get(11)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let tags_key = database_path_key(db, PathColumn::SkillTags, &path)?;
+    let tags = db
+        .query_row(
+            "SELECT tags, tags_json FROM skill_tags WHERE skill_path = ?",
+            [&tags_key],
+            |row| {
+                Ok(SkillTagsRow {
+                    tags: row.get(0)?,
+                    tags_json: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let library_skill = if table_exists(db, "library_skills")? {
+        let library_key = database_path_key(db, PathColumn::LibrarySkill, &path)?;
+        db.query_row(
+            "SELECT id, name, source, source_kind, resolved_ref, content_hash,
+                    created_at, updated_at
+             FROM library_skills WHERE library_path = ?",
+            [&library_key],
+            |row| {
+                Ok(LibrarySkillRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    source: row.get(2)?,
+                    source_kind: row.get(3)?,
+                    resolved_ref: row.get(4)?,
+                    content_hash: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    let deployment = if table_exists(db, "skill_deployments")? {
+        let deployment_key = database_path_key(db, PathColumn::DeploymentTarget, &path)?;
+        db.query_row(
+            "SELECT skill_id, library_path, assistant, scope, project_path,
+                    deploy_mode, deployed_at
+             FROM skill_deployments WHERE target_path = ?",
+            [&deployment_key],
+            |row| {
+                Ok(SkillDeploymentRow {
+                    skill_id: row.get(0)?,
+                    library_path: row.get(1)?,
+                    assistant: row.get(2)?,
+                    scope: row.get(3)?,
+                    project_path: row.get(4)?,
+                    deploy_mode: row.get(5)?,
+                    deployed_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    Ok(PathMetadataCheckpoint {
+        path,
+        origin,
+        installation,
+        tags,
+        library_skill,
+        deployment,
+    })
+}
+
+fn restore_path_metadata(
+    db: &Connection,
+    checkpoint: &PathMetadataCheckpoint,
+) -> Result<(), String> {
+    let origin_key = database_path_key(db, PathColumn::SkillOrigin, &checkpoint.path)?;
+    db.execute(
+        "DELETE FROM skill_origin_meta WHERE skill_path = ?",
+        [&origin_key],
+    )
+    .map_err(|error| error.to_string())?;
+    let installation_key =
+        database_path_key(db, PathColumn::ManagedInstallation, &checkpoint.path)?;
+    db.execute(
+        "DELETE FROM managed_installations WHERE skill_path = ?",
+        [&installation_key],
+    )
+    .map_err(|error| error.to_string())?;
+    let tags_key = database_path_key(db, PathColumn::SkillTags, &checkpoint.path)?;
+    db.execute("DELETE FROM skill_tags WHERE skill_path = ?", [&tags_key])
+        .map_err(|error| error.to_string())?;
+    if let Some(row) = &checkpoint.origin {
+        db.execute(
+            "INSERT INTO skill_origin_meta (
+                skill_path, origin_kind, origin_locator, resolved_locator, tracking_ref,
+                installed_ref, latest_ref, sync_state, sync_message, lag_count, last_probe_at,
+                last_sync_at, managed_by_app
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                &origin_key,
+                &row.origin_kind,
+                &row.origin_locator,
+                &row.resolved_locator,
+                &row.tracking_ref,
+                &row.installed_ref,
+                &row.latest_ref,
+                &row.sync_state,
+                &row.sync_message,
+                row.lag_count,
+                row.last_probe_at,
+                row.last_sync_at,
+                row.managed_by_app,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if let Some(row) = &checkpoint.installation {
+        db.execute(
+            "INSERT INTO managed_installations (
+                skill_path, assistant, source, source_kind, target_name, scope, install_mode,
+                project_path, tracking_ref, subdir, resolved_ref, content_hash, installed_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                &installation_key,
+                &row.assistant,
+                &row.source,
+                &row.source_kind,
+                &row.target_name,
+                &row.scope,
+                &row.install_mode,
+                &row.project_path,
+                &row.tracking_ref,
+                &row.subdir,
+                &row.resolved_ref,
+                &row.content_hash,
+                &row.installed_at,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if let Some(row) = &checkpoint.tags {
+        db.execute(
+            "INSERT INTO skill_tags (skill_path, tags, tags_json) VALUES (?, ?, ?)",
+            params![&tags_key, &row.tags, &row.tags_json],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn clear_deployment_metadata(
+    db: &Connection,
+    checkpoint: &PathMetadataCheckpoint,
+) -> Result<(), String> {
+    if table_exists(db, "skill_deployments")? {
+        let key = database_path_key(db, PathColumn::DeploymentTarget, &checkpoint.path)?;
+        db.execute(
+            "DELETE FROM skill_deployments WHERE target_path = ?",
+            [&key],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn clear_library_skill_metadata(
+    db: &Connection,
+    checkpoint: &PathMetadataCheckpoint,
+) -> Result<(), String> {
+    if checkpoint.library_skill.is_some() {
+        return Ok(());
+    }
+    if table_exists(db, "library_skills")? {
+        let key = database_path_key(db, PathColumn::LibrarySkill, &checkpoint.path)?;
+        db.execute("DELETE FROM library_skills WHERE library_path = ?", [&key])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn restore_library_skill_metadata(
+    db: &Connection,
+    checkpoint: &PathMetadataCheckpoint,
+) -> Result<(), String> {
+    let Some(row) = &checkpoint.library_skill else {
+        return Ok(());
+    };
+    if !table_exists(db, "library_skills")? {
+        return Ok(());
+    }
+    let library_key = database_path_key(db, PathColumn::LibrarySkill, &checkpoint.path)?;
+    db.execute(
+        "INSERT INTO library_skills (
+            id, name, library_path, source, source_kind, resolved_ref, content_hash,
+            created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(library_path) DO UPDATE SET
+            name = excluded.name,
+            source = excluded.source,
+            source_kind = excluded.source_kind,
+            resolved_ref = excluded.resolved_ref,
+            content_hash = excluded.content_hash,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at",
+        params![
+            &row.id,
+            &row.name,
+            library_key,
+            &row.source,
+            &row.source_kind,
+            &row.resolved_ref,
+            &row.content_hash,
+            &row.created_at,
+            &row.updated_at,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn restore_deployment_metadata(
+    db: &Connection,
+    checkpoint: &PathMetadataCheckpoint,
+) -> Result<(), String> {
+    let Some(row) = &checkpoint.deployment else {
+        return Ok(());
+    };
+    if !table_exists(db, "skill_deployments")? {
+        return Ok(());
+    }
+    let target_key = database_path_key(db, PathColumn::DeploymentTarget, &checkpoint.path)?;
+    db.execute(
+        "INSERT INTO skill_deployments (
+            target_path, skill_id, library_path, assistant, scope, project_path,
+            deploy_mode, deployed_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            target_key,
+            &row.skill_id,
+            &row.library_path,
+            &row.assistant,
+            &row.scope,
+            &row.project_path,
+            &row.deploy_mode,
+            &row.deployed_at,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn list_managed_installations(db: &Connection) -> Result<Vec<ManagedInstallation>, String> {
+    let mut statement = db
+        .prepare(
+            "SELECT skill_path, assistant, source, source_kind, target_name, scope,
+                    install_mode, project_path, tracking_ref, subdir, resolved_ref, content_hash
+             FROM managed_installations ORDER BY skill_path",
+        )
+        .map_err(|error| error.to_string())?;
+    let installations = statement
+        .query_map([], |row| {
+            Ok(ManagedInstallation {
+                path: PathBuf::from(row.get::<_, String>(0)?),
+                skill: SkillDescriptor {
+                    assistant: row.get(1)?,
+                    source: row.get(2)?,
+                    source_kind: row.get(3)?,
+                    target_name: Some(row.get(4)?),
+                    scope: Some(row.get(5)?),
+                    install_mode: Some(row.get(6)?),
+                    project_path: row.get(7)?,
+                    reference: row.get(8)?,
+                    subdir: row.get(9)?,
+                    resolved_ref: row.get(10)?,
+                    content_hash: row.get(11)?,
+                },
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(installations)
+}
+
+pub fn register_managed_root(
+    db: &Connection,
+    root: &Path,
+    scope: &str,
+    project_path: Option<&str>,
+) -> Result<(), String> {
+    let root_key = database_path_key(db, PathColumn::ManagedRoot, root)?;
+    db.execute(
+        "INSERT INTO managed_roots (root_path, scope, project_path, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(root_path) DO UPDATE SET
+            scope = excluded.scope,
+            project_path = COALESCE(excluded.project_path, managed_roots.project_path),
+            updated_at = excluded.updated_at",
+        params![
+            root_key,
+            scope,
+            project_path,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn list_managed_roots(db: &Connection) -> Result<Vec<ManagedRoot>, String> {
+    let mut statement = db
+        .prepare("SELECT root_path, scope, project_path FROM managed_roots ORDER BY root_path")
+        .map_err(|error| error.to_string())?;
+    let roots = statement
+        .query_map([], |row| {
+            Ok(ManagedRoot {
+                path: PathBuf::from(row.get::<_, String>(0)?),
+                scope: row.get(1)?,
+                project_path: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(roots)
+}
+
+pub fn backfill_managed_roots(db: &Connection) -> Result<usize, String> {
+    let installations = list_managed_installations(db)?;
+    let mut roots = std::collections::BTreeMap::new();
+    for installation in installations {
+        let Some(root) = installation.path.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        roots.entry(root).or_insert_with(|| {
+            (
+                installation
+                    .skill
+                    .scope
+                    .clone()
+                    .unwrap_or_else(|| "global".to_string()),
+                installation.skill.project_path.clone(),
+            )
+        });
+    }
+    for (root, (scope, project_path)) in &roots {
+        register_managed_root(db, root, scope, project_path.as_deref())?;
+    }
+    Ok(roots.len())
+}
+
+pub fn find_managed_installation(
+    db: &Connection,
+    path: &Path,
+) -> Result<Option<ManagedInstallation>, String> {
+    let path = database_path_key(db, PathColumn::ManagedInstallation, path)?;
+    let mut statement = db
+        .prepare(
+            "SELECT skill_path, assistant, source, source_kind, target_name, scope,
+                    install_mode, project_path, tracking_ref, subdir, resolved_ref, content_hash
+             FROM managed_installations WHERE skill_path = ?",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([path]).map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    Ok(Some(ManagedInstallation {
+        path: PathBuf::from(row.get::<_, String>(0).map_err(|error| error.to_string())?),
+        skill: SkillDescriptor {
+            assistant: row.get(1).map_err(|error| error.to_string())?,
+            source: row.get(2).map_err(|error| error.to_string())?,
+            source_kind: row.get(3).map_err(|error| error.to_string())?,
+            target_name: Some(row.get(4).map_err(|error| error.to_string())?),
+            scope: Some(row.get(5).map_err(|error| error.to_string())?),
+            install_mode: Some(row.get(6).map_err(|error| error.to_string())?),
+            project_path: row.get(7).map_err(|error| error.to_string())?,
+            reference: row.get(8).map_err(|error| error.to_string())?,
+            subdir: row.get(9).map_err(|error| error.to_string())?,
+            resolved_ref: row.get(10).map_err(|error| error.to_string())?,
+            content_hash: row.get(11).map_err(|error| error.to_string())?,
+        },
+    }))
+}
+
+pub fn is_explicitly_managed(db: &Connection, path: &Path) -> Result<bool, String> {
+    if find_managed_installation(db, path)?.is_some() {
+        return Ok(true);
+    }
+    match path.parent() {
+        Some(root) => is_managed_by_state(root, path),
+        None => Ok(false),
+    }
+}
+
+pub fn verify_managed_content_unchanged(db: &Connection, path: &Path) -> Result<(), String> {
+    let installation = find_managed_installation(db, path)?;
+    let state_entry = match path.parent() {
+        Some(root) => managed_state_entry(root, path)?,
+        None => None,
+    };
+    let mut expected = Vec::new();
+    if let Some(hash) = installation
+        .as_ref()
+        .and_then(|item| item.skill.content_hash.as_deref())
+        .filter(|hash| !hash.trim().is_empty())
+    {
+        expected.push(("数据库", hash));
+    }
+    if let Some(hash) = state_entry
+        .as_ref()
+        .map(|item| item.last_seen_hash.as_str())
+        .filter(|hash| !hash.trim().is_empty())
+    {
+        expected.push(("受管状态", hash));
+    }
+    if expected.is_empty() {
+        return Err("受管 Skill 缺少内容指纹，已拒绝破坏性操作".to_string());
+    }
+    for (source, hash) in expected {
+        if !fingerprint_matches(path, hash)? {
+            return Err(format!(
+                "Skill 内容已偏离安装时状态（{}指纹不一致），请先备份或重新安装",
+                source
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 进程级跳过缓存：单个 Skill 迁移失败（特殊文件、漂移）后不再每次
+/// 排他操作重付全树哈希与警告；重新安装会写入 v2 指纹使其退出候选，
+/// 手工清理特殊文件后重启应用也会重试。
+fn skipped_migration_cache() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SKIPPED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SKIPPED.get_or_init(Default::default)
+}
+
+fn migration_skip_key(stored_path: &str, old_hash: &str) -> String {
+    format!("{stored_path}\u{0}{old_hash}")
+}
+
+pub(crate) fn migrate_managed_installation_fingerprints(
+    db: &Connection,
+) -> Result<(usize, Vec<String>), String> {
+    let transaction = db
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let candidates = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT skill_path, content_hash FROM managed_installations
+                 WHERE (content_hash LIKE 'sha256:%' AND content_hash NOT LIKE 'sha256:v2:%')
+                    OR content_hash LIKE 'fnv1a64:%'",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    let has_library = table_exists(&transaction, "library_skills")?;
+    let mut migrated = 0;
+    let mut warnings = Vec::new();
+    for (stored_path, old_hash) in candidates {
+        let path = Path::new(&stored_path);
+        let skip_key = migration_skip_key(&stored_path, &old_hash);
+        if skipped_migration_cache()
+            .lock()
+            .map(|cache| cache.contains(&skip_key))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let mut skip = |reason: String| {
+            if let Ok(mut cache) = skipped_migration_cache().lock() {
+                cache.insert(skip_key.clone());
+            }
+            warnings.push(format!(
+                "已跳过 {} 的内容指纹迁移（保留旧基线，不影响漂移检测；重新安装该 Skill 后可消除）: {}",
+                stored_path, reason
+            ));
+        };
+        if let Err(error) = std::fs::symlink_metadata(path) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            skip(format!("读取旧受管内容失败: {error}"));
+            continue;
+        }
+        let state_entry = match path
+            .parent()
+            .map(|root| managed_state_entry(root, path))
+            .transpose()
+        {
+            Ok(entry) => entry.flatten(),
+            Err(error) => {
+                skip(error);
+                continue;
+            }
+        };
+        let library_key = if has_library {
+            Some(database_path_key(
+                &transaction,
+                PathColumn::LibrarySkill,
+                path,
+            )?)
+        } else {
+            None
+        };
+        let library_hash: Option<String> = match &library_key {
+            Some(key) => transaction
+                .query_row(
+                    "SELECT content_hash FROM library_skills WHERE library_path = ?",
+                    [key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?,
+            None => None,
+        };
+        let mut baselines = vec![old_hash.as_str()];
+        if let Some(entry) = &state_entry {
+            baselines.push(&entry.last_seen_hash);
+        }
+        if let Some(hash) = &library_hash {
+            baselines.push(hash);
+        }
+        let matches_all = || -> Result<bool, String> {
+            for baseline in &baselines {
+                if !fingerprint_matches(path, baseline)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        // 单个 Skill 无法迁移（如包含 FIFO 等特殊文件、内容已漂移）时保留旧基线：
+        // 旧算法核验路径仍然有效，跳过只影响升级速度，不扩大阻塞面。
+        match matches_all() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                skip(error);
+                continue;
+            }
+        }
+        let new_hash = match content_fingerprint(path) {
+            Ok(hash) => hash,
+            Err(error) => {
+                skip(error);
+                continue;
+            }
+        };
+        match matches_all() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                skip("迁移数据库指纹期间 Skill 已变化".to_string());
+                continue;
+            }
+        }
+        match content_fingerprint(path) {
+            Ok(hash) if hash == new_hash => {}
+            Ok(_) | Err(_) => {
+                skip("迁移数据库指纹期间 Skill 已变化".to_string());
+                continue;
+            }
+        }
+        // 只替换实际核验过的旧基线，保留安装时间和仅数据库登记的管理身份。
+        let updated = transaction
+            .execute(
+                "UPDATE managed_installations SET content_hash = ?
+                 WHERE skill_path = ? AND content_hash = ?",
+                params![new_hash, stored_path, old_hash],
+            )
+            .map_err(|error| format!("迁移受管内容指纹失败: {error}"))?;
+        if updated != 1 {
+            return Err("迁移期间受管安装记录已变化".into());
+        }
+        if library_hash.as_deref() == Some(old_hash.as_str()) {
+            let updated = transaction
+                .execute(
+                    "UPDATE library_skills SET content_hash = ?
+                     WHERE library_path = ? AND content_hash = ?",
+                    params![new_hash, library_key, old_hash],
+                )
+                .map_err(|error| format!("迁移统一库内容指纹失败: {error}"))?;
+            if updated != 1 {
+                return Err("迁移期间统一库记录已变化".into());
+            }
+        }
+        migrated += 1;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok((migrated, warnings))
+}
+
+pub fn record_managed_root(
+    db: &Connection,
+    root: &Path,
+    scope: &str,
+    project_path: Option<&str>,
+) -> Result<usize, String> {
+    register_managed_root(db, root, scope, project_path)?;
+    let state = read_managed_state(root)?;
+    let mut records = Vec::new();
+    for entry in state.managed_skills {
+        if let Some(record) = managed_record_from_state(&entry, scope, project_path)? {
+            records.push(record);
+        }
+    }
+    let transaction = db
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    for (path, skill) in &records {
+        record_managed_installation(&transaction, path, skill)?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(records.len())
+}
+
+pub fn record_managed_path(
+    db: &Connection,
+    root: &Path,
+    path: &Path,
+    scope: &str,
+    project_path: Option<&str>,
+) -> Result<(), String> {
+    register_managed_root(db, root, scope, project_path)?;
+    let entry = managed_state_entry(root, path)?
+        .ok_or_else(|| "安装完成后未找到对应受管状态".to_string())?;
+    let (path, skill) = managed_record_from_state(&entry, scope, project_path)?
+        .ok_or_else(|| "安装目标在登记前已消失".to_string())?;
+    record_managed_installation(db, &path, &skill)
+}
+
+fn managed_record_from_state(
+    entry: &ManagedSkillState,
+    scope: &str,
+    project_path: Option<&str>,
+) -> Result<Option<(PathBuf, SkillDescriptor)>, String> {
+    let path = PathBuf::from(&entry.path);
+    if !path.exists() && std::fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let (source, source_kind, install_mode) = parse_state_origin(&entry.origin);
+    let parsed_git = if is_git_install_source(&source_kind) {
+        parse_git_install_spec(&source).ok()
+    } else {
+        None
+    };
+    let skill = SkillDescriptor {
+        assistant: entry.assistant.clone(),
+        source,
+        source_kind,
+        target_name: path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string()),
+        scope: Some(scope.to_string()),
+        install_mode: Some(install_mode),
+        project_path: project_path.map(str::to_string),
+        reference: parsed_git.as_ref().and_then(|spec| spec.reference.clone()),
+        subdir: parsed_git.as_ref().and_then(|spec| spec.subdir.clone()),
+        resolved_ref: None,
+        content_hash: Some(content_fingerprint(&path)?),
+    };
+    Ok(Some((path, skill)))
+}
+
+pub fn record_managed_installation(
+    db: &Connection,
+    path: &Path,
+    skill: &SkillDescriptor,
+) -> Result<(), String> {
+    let target_name = skill
+        .target_name
+        .as_deref()
+        .or_else(|| path.file_name().and_then(|value| value.to_str()))
+        .ok_or_else(|| "受管安装缺少 target_name".to_string())?;
+    let content_hash = content_fingerprint(path)?;
+    let path_key = database_path_key(db, PathColumn::ManagedInstallation, path)?;
+    db.execute(
+        "INSERT INTO managed_installations (
+            skill_path, assistant, source, source_kind, target_name, scope, install_mode,
+            project_path, tracking_ref, subdir, resolved_ref, content_hash, installed_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(skill_path) DO UPDATE SET
+            assistant = excluded.assistant,
+            source = excluded.source,
+            source_kind = excluded.source_kind,
+            target_name = excluded.target_name,
+            scope = excluded.scope,
+            install_mode = excluded.install_mode,
+            project_path = excluded.project_path,
+            tracking_ref = excluded.tracking_ref,
+            subdir = excluded.subdir,
+            resolved_ref = COALESCE(excluded.resolved_ref, managed_installations.resolved_ref),
+            content_hash = excluded.content_hash",
+        params![
+            path_key,
+            skill.assistant,
+            skill.source,
+            skill.source_kind,
+            target_name,
+            skill.scope.as_deref().unwrap_or("global"),
+            skill.install_mode.as_deref().unwrap_or("copy"),
+            skill.project_path,
+            skill.reference,
+            skill.subdir,
+            skill.resolved_ref,
+            content_hash,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn refresh_managed_installation(
+    db: &Connection,
+    path: &Path,
+    resolved_ref: Option<&str>,
+) -> Result<bool, String> {
+    let content_hash = content_fingerprint(path)?;
+    let path_key = database_path_key(db, PathColumn::ManagedInstallation, path)?;
+    let updated = db
+        .execute(
+            "UPDATE managed_installations
+             SET content_hash = ?, resolved_ref = COALESCE(?, resolved_ref)
+             WHERE skill_path = ?",
+            params![
+                content_hash,
+                resolved_ref.filter(|value| !value.trim().is_empty()),
+                path_key
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(updated > 0)
+}
+
+pub fn cleanup_skill_metadata(db: &Connection, target_path: &Path) -> Result<(), String> {
+    let state_checkpoint = target_path
+        .parent()
+        .map(ManagedStateCheckpoint::capture)
+        .transpose()?;
+    if let Some(root) = target_path.parent() {
+        unmark_managed_skill(root, target_path)?;
+    }
+    let database_result = (|| {
+        let transaction = db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        delete_path_metadata(&transaction, target_path)?;
+        transaction.commit().map_err(|error| error.to_string())
+    })();
+    if let Err(error) = database_result {
+        if let (Some(root), Some(checkpoint)) = (target_path.parent(), state_checkpoint) {
+            return match checkpoint.restore(root) {
+                Ok(()) => Err(error),
+                Err(restore_error) => {
+                    Err(format!("{}；恢复受管状态失败: {}", error, restore_error))
+                }
+            };
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn prune_missing_managed_installations(db: &Connection) -> Result<usize, String> {
+    prune_missing_managed_installations_with(db, remove_path)
+}
+
+fn prune_missing_managed_installations_with(
+    db: &Connection,
+    mut unlink: impl FnMut(&Path) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut missing_deployments = Vec::new();
+    let mut missing_installations = Vec::new();
+    for installation in list_managed_installations(db)? {
+        if !managed_path_is_missing(&installation.path) {
+            continue;
+        }
+        if is_registered_deployment(db, &installation.path)? {
+            missing_deployments.push(installation.path);
+        } else {
+            missing_installations.push(installation.path);
+        }
+    }
+    missing_deployments.append(&mut missing_installations);
+    let missing = missing_deployments;
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    let checkpoint = ManagedMetadataCheckpoint::capture(db, &missing)?;
+    let mut removed_links = Vec::new();
+    let cleanup_result = (|| {
+        for path in &missing {
+            if crate::app_core::path_is_directory_link(path).unwrap_or(false) {
+                let target = std::fs::read_link(path).map_err(|error| error.to_string())?;
+                removed_links.push((path.clone(), target));
+                unlink(path)?;
+            }
+        }
+        for path in &missing {
+            if let Some(root) = path.parent() {
+                unmark_managed_skill(root, path)?;
+            }
+        }
+        let transaction = db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for path in &missing {
+            delete_path_metadata(&transaction, path)?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    })();
+    if let Err(error) = cleanup_result {
+        let mut restore_errors = Vec::new();
+        if let Err(restore_error) = checkpoint.restore(db) {
+            restore_errors.push(format!("恢复受管记录失败: {restore_error}"));
+        }
+        for (path, target) in removed_links.iter().rev() {
+            if let Err(restore_error) = restore_directory_symlink(path, target) {
+                restore_errors.push(restore_error);
+            }
+        }
+        return if restore_errors.is_empty() {
+            Err(error)
+        } else {
+            Err(format!("{}；{}", error, restore_errors.join("；")))
+        };
+    }
+    Ok(missing.len())
+}
+
+fn restore_directory_symlink(path: &Path, target: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) if std::fs::read_link(path).ok().as_deref() == Some(target) => return Ok(()),
+        Ok(_) => {
+            return Err(format!(
+                "恢复目录链接失败，位置已被占用: {}",
+                path.to_string_lossy()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法检查待恢复目录链接: {error}")),
+    }
+    crate::skill_library::create_directory_link(target, path)
+        .map(|_| ())
+        .map_err(|error| format!("恢复目录链接失败 {}: {error}", path.to_string_lossy()))
+}
+
+fn managed_path_is_missing(path: &Path) -> bool {
+    if path.exists() {
+        return false;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => crate::app_core::metadata_is_directory_link(&metadata),
+        Err(_) => true,
+    }
+}
+
+fn is_registered_deployment(db: &Connection, path: &Path) -> Result<bool, String> {
+    if !table_exists(db, "skill_deployments")? {
+        return Ok(false);
+    }
+    let path_key = database_path_key(db, PathColumn::DeploymentTarget, path)?;
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM skill_deployments WHERE target_path = ?)",
+        [path_key],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn delete_path_metadata(db: &Connection, path: &Path) -> Result<(), String> {
+    if table_exists(db, "skill_deployments")? {
+        let target_key = database_path_key(db, PathColumn::DeploymentTarget, path)?;
+        db.execute(
+            "DELETE FROM skill_deployments WHERE target_path = ?",
+            params![target_key],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if table_exists(db, "library_skills")? {
+        let library_key = database_path_key(db, PathColumn::LibrarySkill, path)?;
+        db.execute(
+            "DELETE FROM library_skills WHERE library_path = ?",
+            params![library_key],
+        )
+        .map_err(|error| {
+            // 只有外键约束失败才代表部署仍然存在；其余是真实的数据库错误，
+            // 不能翻译成误导性的「仍在启用」。SQLite 的外键冲突只返回主码
+            // SQLITE_CONSTRAINT（无专用扩展码），故以主码 + SQLite 原生消息共同判定。
+            let is_fk_violation = matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::ConstraintViolation,
+                        ..
+                    },
+                    Some(message),
+                ) if message.contains("FOREIGN KEY")
+            );
+            if is_fk_violation {
+                format!("该 Skill 仍在平台或项目中启用，请先停用后再删除: {error}")
+            } else {
+                error.to_string()
+            }
+        })?;
+    }
+    let origin_key = database_path_key(db, PathColumn::SkillOrigin, path)?;
+    db.execute(
+        "DELETE FROM skill_origin_meta WHERE skill_path = ?",
+        params![origin_key],
+    )
+    .map_err(|error| error.to_string())?;
+    let tags_key = database_path_key(db, PathColumn::SkillTags, path)?;
+    db.execute(
+        "DELETE FROM skill_tags WHERE skill_path = ?",
+        params![tags_key],
+    )
+    .map_err(|error| error.to_string())?;
+    let installation_key = database_path_key(db, PathColumn::ManagedInstallation, path)?;
+    db.execute(
+        "DELETE FROM managed_installations WHERE skill_path = ?",
+        params![installation_key],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn table_exists(db: &Connection, table: &str) -> Result<bool, String> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn parse_state_origin(origin: &str) -> (String, String, String) {
+    if let Some(source) = origin.strip_prefix("symlink:") {
+        return (
+            source.to_string(),
+            "local".to_string(),
+            "symlink".to_string(),
+        );
+    }
+    if let Some(source) = origin.strip_prefix("local:") {
+        return (source.to_string(), "local".to_string(), "copy".to_string());
+    }
+    (origin.to_string(), "git".to_string(), "copy".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_state::mark_managed_skill;
+
+    fn database() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE managed_installations (
+                skill_path TEXT PRIMARY KEY, assistant TEXT NOT NULL, source TEXT NOT NULL,
+                source_kind TEXT NOT NULL, target_name TEXT NOT NULL, scope TEXT NOT NULL,
+                install_mode TEXT NOT NULL, project_path TEXT, tracking_ref TEXT, subdir TEXT,
+                resolved_ref TEXT, content_hash TEXT, installed_at TEXT NOT NULL
+            );
+            CREATE TABLE skill_origin_meta (
+                skill_path TEXT PRIMARY KEY, origin_kind TEXT NOT NULL, origin_locator TEXT NOT NULL,
+                resolved_locator TEXT NOT NULL, tracking_ref TEXT NOT NULL, installed_ref TEXT NOT NULL,
+                latest_ref TEXT NOT NULL, sync_state TEXT NOT NULL, sync_message TEXT NOT NULL,
+                lag_count INTEGER NOT NULL, last_probe_at INTEGER, last_sync_at INTEGER,
+                managed_by_app INTEGER NOT NULL
+            );
+            CREATE TABLE skill_tags (
+                skill_path TEXT PRIMARY KEY, tags TEXT, tags_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE managed_roots (
+                root_path TEXT PRIMARY KEY, scope TEXT NOT NULL,
+                project_path TEXT, updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        db
+    }
+
+    fn legacy_registry_fixture(db: &Connection, root: &Path, name: &str) -> (PathBuf, String) {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("a"), "X").unwrap();
+        std::fs::write(path.join("b"), "Y").unwrap();
+        let mut hash = crate::operation_plan::StableHash::new();
+        hash.update(b"directoryafileXbfileY");
+        let old_hash = format!("sha256:{}", hash.finish());
+        db.execute(
+            "INSERT INTO managed_installations VALUES (?, 'Codex', '/source', 'local', ?,
+             'project', 'copy', '/project', NULL, NULL, NULL, ?, 'installed')",
+            params![path.to_string_lossy(), name, old_hash],
+        )
+        .unwrap();
+        (path, old_hash)
+    }
+
+    #[test]
+    fn database_only_fingerprint_migration_is_idempotent_and_protects_file_boundaries() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-registry-migration-{}",
+            crate::app_core::generate_id()
+        ));
+        let (path, old_hash) = legacy_registry_fixture(&db, &root, "writer");
+        assert!(fingerprint_matches(&path, &old_hash).unwrap());
+        assert_eq!(migrate_managed_installation_fingerprints(&db).unwrap().0, 1);
+        let installation = find_managed_installation(&db, &path).unwrap().unwrap();
+        assert_eq!(
+            installation.skill.content_hash,
+            Some(content_fingerprint(&path).unwrap())
+        );
+        assert!(!root.join(crate::managed_state::STATE_FILE_NAME).exists());
+        assert_eq!(migrate_managed_installation_fingerprints(&db).unwrap().0, 0);
+        verify_managed_content_unchanged(&db, &path).unwrap();
+
+        std::fs::write(path.join("a"), "XbfileY").unwrap();
+        std::fs::remove_file(path.join("b")).unwrap();
+        assert!(fingerprint_matches(&path, &old_hash).unwrap());
+        assert!(verify_managed_content_unchanged(&db, &path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_fingerprint_migration_preserves_drifted_and_missing_baselines() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-registry-drift-migration-{}",
+            crate::app_core::generate_id()
+        ));
+        let (edited, edited_hash) = legacy_registry_fixture(&db, &root, "edited");
+        let (missing, missing_hash) = legacy_registry_fixture(&db, &root, "missing");
+        std::fs::write(edited.join("a"), "manual edit").unwrap();
+        std::fs::remove_dir_all(&missing).unwrap();
+        assert_eq!(migrate_managed_installation_fingerprints(&db).unwrap().0, 0);
+        for (path, hash) in [(&edited, edited_hash), (&missing, missing_hash)] {
+            assert_eq!(
+                find_managed_installation(&db, path)
+                    .unwrap()
+                    .unwrap()
+                    .skill
+                    .content_hash,
+                Some(hash)
+            );
+        }
+        assert!(verify_managed_content_unchanged(&db, &edited).is_err());
+        assert!(!root.join(crate::managed_state::STATE_FILE_NAME).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_fingerprint_migration_requires_matching_sidecar() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-registry-sidecar-migration-{}",
+            crate::app_core::generate_id()
+        ));
+        let (path, old_hash) = legacy_registry_fixture(&db, &root, "writer");
+        std::fs::write(path.join("a"), "sidecar baseline").unwrap();
+        mark_managed_skill(&root, "Codex", &path, "local:/source").unwrap();
+        std::fs::write(path.join("a"), "X").unwrap();
+        assert_eq!(migrate_managed_installation_fingerprints(&db).unwrap().0, 0);
+        assert_eq!(
+            find_managed_installation(&db, &path)
+                .unwrap()
+                .unwrap()
+                .skill
+                .content_hash,
+            Some(old_hash)
+        );
+        assert!(verify_managed_content_unchanged(&db, &path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_fingerprint_migration_skips_unsupported_file_types_without_blocking() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-registry-fifo-migration-{}",
+            crate::app_core::generate_id()
+        ));
+        let (path, _old_hash) = legacy_registry_fixture(&db, &root, "writer");
+        #[cfg(unix)]
+        let fifo_ready = {
+            let status = std::process::Command::new("mkfifo")
+                .arg(path.join("pipe"))
+                .status();
+            matches!(status, Ok(status) if status.success())
+        };
+        #[cfg(not(unix))]
+        let fifo_ready = false;
+        if fifo_ready {
+            // legacy 算法对 FIFO 只记录路径字节，这里构造出与当前内容
+            // （含 FIFO）一致的旧基线，让迁移走到 v2 指纹报错的一步。
+            let mut hash = crate::operation_plan::StableHash::new();
+            hash.update(b"directoryafileXbfileYpipe");
+            let legacy_with_fifo = format!("sha256:{}", hash.finish());
+            assert!(crate::managed_state::fingerprint_matches(&path, &legacy_with_fifo).unwrap());
+            db.execute(
+                "UPDATE managed_installations SET content_hash = ? WHERE skill_path = ?",
+                [&legacy_with_fifo, &path.to_string_lossy().to_string()],
+            )
+            .unwrap();
+            // 旧算法能容忍 FIFO 等特殊文件；迁移失败必须降级为跳过，
+            // 不能让升级后的受管目录拦死所有操作。
+            let (migrated, warnings) = migrate_managed_installation_fingerprints(&db).unwrap();
+            assert_eq!(migrated, 0);
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(
+                find_managed_installation(&db, &path)
+                    .unwrap()
+                    .unwrap()
+                    .skill
+                    .content_hash,
+                Some(legacy_with_fifo)
+            );
+            // 旧基线核验路径仍然有效，破坏性操作保护不受影响。
+            verify_managed_content_unchanged(&db, &path).unwrap();
+            // 跳过结果进程内缓存：再次迁移不再重付哈希与警告。
+            let (_, repeat_warnings) = migrate_managed_installation_fingerprints(&db).unwrap();
+            assert!(repeat_warnings.is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_fingerprint_migration_rolls_back_when_library_write_fails() {
+        let db = database();
+        db.execute_batch(
+            "CREATE TABLE library_skills (
+                library_path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TRIGGER fail_migration BEFORE UPDATE ON library_skills
+             BEGIN SELECT RAISE(FAIL, 'injected migration failure'); END;",
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-registry-rollback-migration-{}",
+            crate::app_core::generate_id()
+        ));
+        let (path, old_hash) = legacy_registry_fixture(&db, &root, "writer");
+        db.execute(
+            "INSERT INTO library_skills VALUES (?, ?, 'untouched')",
+            params![path.to_string_lossy(), old_hash],
+        )
+        .unwrap();
+        assert!(migrate_managed_installation_fingerprints(&db)
+            .unwrap_err()
+            .contains("injected migration failure"));
+        assert_eq!(
+            find_managed_installation(&db, &path)
+                .unwrap()
+                .unwrap()
+                .skill
+                .content_hash,
+            Some(old_hash.clone())
+        );
+        db.execute_batch("DROP TRIGGER fail_migration").unwrap();
+        assert_eq!(migrate_managed_installation_fingerprints(&db).unwrap().0, 1);
+        let row: (String, String) = db
+            .query_row(
+                "SELECT content_hash, updated_at FROM library_skills",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (content_fingerprint(&path).unwrap(), "untouched".into())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_path_metadata_reports_fk_violation_as_still_enabled() {
+        let db = database();
+        db.execute_batch(
+            "CREATE TABLE library_skills (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, library_path TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL, source_kind TEXT NOT NULL, resolved_ref TEXT,
+                content_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE skill_deployments (
+                target_path TEXT PRIMARY KEY, skill_id TEXT NOT NULL,
+                library_path TEXT NOT NULL, assistant TEXT NOT NULL, scope TEXT NOT NULL,
+                project_path TEXT, deploy_mode TEXT NOT NULL, deployed_at TEXT NOT NULL,
+                FOREIGN KEY(skill_id) REFERENCES library_skills(id) ON DELETE RESTRICT
+             );
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        let library = std::env::temp_dir().join(format!(
+            "skillmate-fk-delete-{}",
+            crate::app_core::generate_id()
+        ));
+        let library_key = library.to_string_lossy().to_string();
+        db.execute(
+            "INSERT INTO library_skills VALUES ('skill-1', 'writer', ?, 'local', 'local', NULL,
+             'hash', 'now', 'now')",
+            [&library_key],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO skill_deployments VALUES ('/tmp/deploy/writer', 'skill-1', ?, 'Codex',
+             'global', NULL, 'symlink', 'now')",
+            [&library_key],
+        )
+        .unwrap();
+
+        // 仍有启用时删除主副本：只有外键冲突才提示「仍在启用」。
+        let error = delete_path_metadata(&db, &library).unwrap_err();
+        assert!(error.contains("仍在平台或项目中启用"), "{error}");
+        let _ = std::fs::remove_dir_all(library);
+    }
+
+    #[test]
+    fn metadata_checkpoint_accepts_journal_without_managed_roots() {
+        let checkpoint: ManagedMetadataCheckpoint =
+            serde_json::from_str(r#"{"paths":[],"roots":[]}"#).unwrap();
+
+        assert!(checkpoint.managed_roots.is_empty());
+        assert!(checkpoint.scenario_references.is_empty());
+    }
+
+    #[test]
+    fn serialized_metadata_checkpoint_restores_only_related_scenario_references() {
+        let db = database();
+        db.execute_batch(
+            "CREATE TABLE scenarios (id TEXT PRIMARY KEY, skill_ids TEXT, skill_ids_json TEXT NOT NULL);
+             INSERT INTO scenarios VALUES ('related', '/project/writer', '[]');
+             INSERT INTO scenarios VALUES ('unrelated', '', '[\"/other/reviewer\"]');",
+        ).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-scenario-checkpoint-{}",
+            crate::app_core::generate_id(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("writer");
+        let original = serde_json::to_string(&[source.to_string_lossy()]).unwrap();
+        db.execute(
+            "UPDATE scenarios SET skill_ids_json = ? WHERE id = 'related'",
+            [&original],
+        )
+        .unwrap();
+        let checkpoint = ManagedMetadataCheckpoint::capture_with_scenario_references(
+            &db,
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        let checkpoint: ManagedMetadataCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&checkpoint).unwrap()).unwrap();
+        db.execute_batch(
+            "UPDATE scenarios SET skill_ids = '', skill_ids_json = '[\"/library/writer\"]' WHERE id = 'related';
+             UPDATE scenarios SET skill_ids_json = '[\"/other/changed\"]' WHERE id = 'unrelated';",
+        ).unwrap();
+        checkpoint.restore(&db).unwrap();
+        let related: (String, String) = db
+            .query_row(
+                "SELECT skill_ids, skill_ids_json FROM scenarios WHERE id = 'related'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(related, ("/project/writer".into(), original));
+        let unrelated: String = db
+            .query_row(
+                "SELECT skill_ids_json FROM scenarios WHERE id = 'unrelated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unrelated, "[\"/other/changed\"]");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_checkpoint_removes_deployments_before_library_rows() {
+        let db = database();
+        db.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE library_skills (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, library_path TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL, source_kind TEXT NOT NULL, resolved_ref TEXT,
+                content_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE skill_deployments (
+                target_path TEXT PRIMARY KEY, skill_id TEXT NOT NULL, library_path TEXT NOT NULL,
+                assistant TEXT NOT NULL, scope TEXT NOT NULL, project_path TEXT,
+                deploy_mode TEXT NOT NULL, deployed_at TEXT NOT NULL,
+                FOREIGN KEY(skill_id) REFERENCES library_skills(id) ON DELETE RESTRICT
+             );",
+        )
+        .unwrap();
+        let library_path = PathBuf::from("/tmp/a-skillmate-library/writer");
+        let deployment_path = PathBuf::from("/tmp/z-agent-skills/writer");
+        let checkpoint = ManagedMetadataCheckpoint::capture(
+            &db,
+            &[library_path.clone(), deployment_path.clone()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO library_skills VALUES (?, 'writer', ?, 'local', 'local', NULL,
+             'hash', 'now', 'now')",
+            params!["skill-1", library_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO skill_deployments VALUES (?, 'skill-1', ?, 'Codex', 'global', NULL,
+             'symlink', 'now')",
+            params![
+                deployment_path.to_string_lossy().to_string(),
+                library_path.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+
+        checkpoint.restore(&db).unwrap();
+
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM skill_deployments", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM library_skills", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metadata_checkpoint_preserves_unrelated_library_deployments() {
+        let db = database();
+        db.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE library_skills (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, library_path TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL, source_kind TEXT NOT NULL, resolved_ref TEXT,
+                content_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE skill_deployments (
+                target_path TEXT PRIMARY KEY, skill_id TEXT NOT NULL, library_path TEXT NOT NULL,
+                assistant TEXT NOT NULL, scope TEXT NOT NULL, project_path TEXT,
+                deploy_mode TEXT NOT NULL, deployed_at TEXT NOT NULL,
+                FOREIGN KEY(skill_id) REFERENCES library_skills(id) ON DELETE RESTRICT
+             );",
+        )
+        .unwrap();
+        let library_path = PathBuf::from("/tmp/skillmate-library/writer");
+        let first = PathBuf::from("/tmp/agent-a/writer");
+        let second = PathBuf::from("/tmp/agent-b/writer");
+        db.execute(
+            "INSERT INTO library_skills VALUES (?, 'writer', ?, 'old/source', 'local', NULL,
+             'old-hash', 'old-created', 'old-updated')",
+            params!["skill-1", library_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        for target in [&first, &second] {
+            db.execute(
+                "INSERT INTO skill_deployments VALUES (?, 'skill-1', ?, 'Codex', 'global', NULL,
+                 'symlink', 'old')",
+                params![
+                    target.to_string_lossy().to_string(),
+                    library_path.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let checkpoint =
+            ManagedMetadataCheckpoint::capture(&db, &[library_path.clone(), first.clone()])
+                .unwrap();
+        db.execute(
+            "UPDATE library_skills SET source = 'new/source' WHERE library_path = ?",
+            [library_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM skill_deployments WHERE target_path = ?",
+            [first.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        checkpoint.restore(&db).unwrap();
+
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM skill_deployments", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT source FROM library_skills WHERE library_path = ?",
+                [library_path.to_string_lossy().to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "old/source"
+        );
+    }
+
+    #[test]
+    fn records_project_installation_from_managed_state() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-registry-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let skill = root.join("writer");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "writer").unwrap();
+        mark_managed_skill(&root, "Codex", &skill, "local:/tmp/writer").unwrap();
+
+        record_managed_root(&db, &root, "project", Some("/tmp/project")).unwrap();
+        let installations = list_managed_installations(&db).unwrap();
+
+        assert_eq!(installations.len(), 1);
+        assert_eq!(installations[0].skill.scope.as_deref(), Some("project"));
+        assert_eq!(installations[0].skill.source, "/tmp/writer");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prunes_registry_entries_when_targets_disappear() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-prune-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let skill = root.join("writer");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "writer").unwrap();
+        mark_managed_skill(&root, "Codex", &skill, "local:/tmp/writer").unwrap();
+        record_managed_root(&db, &root, "global", None).unwrap();
+        let key = skill.to_string_lossy().to_string();
+        db.execute(
+            "INSERT INTO skill_origin_meta VALUES (?, 'local', '/tmp/writer', '/tmp/writer', '',
+             '', '', 'current', '', 0, NULL, NULL, 1)",
+            [&key],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO skill_tags (skill_path, tags, tags_json) VALUES (?, '', '[\"old\"]')",
+            [&key],
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&skill).unwrap();
+
+        assert_eq!(prune_missing_managed_installations(&db).unwrap(), 1);
+        assert!(list_managed_installations(&db).unwrap().is_empty());
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM skill_origin_meta WHERE skill_path = ?",
+                [&key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM skill_tags WHERE skill_path = ?",
+                [&key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(crate::managed_state::read_managed_state(&root)
+            .unwrap()
+            .managed_skills
+            .is_empty());
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "replacement").unwrap();
+        assert!(!is_explicitly_managed(&db, &skill).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prunes_broken_deployment_before_missing_library_record() {
+        let db = database();
+        db.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE library_skills (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, library_path TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL, source_kind TEXT NOT NULL, resolved_ref TEXT,
+                content_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE skill_deployments (
+                target_path TEXT PRIMARY KEY, skill_id TEXT NOT NULL, library_path TEXT NOT NULL,
+                assistant TEXT NOT NULL, scope TEXT NOT NULL, project_path TEXT,
+                deploy_mode TEXT NOT NULL, deployed_at TEXT NOT NULL,
+                FOREIGN KEY(skill_id) REFERENCES library_skills(id) ON DELETE RESTRICT
+             );",
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-broken-deployment-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let library_root = root.join("a-library");
+        let deployment_root = root.join("z-deployments");
+        let library_path = library_root.join("writer");
+        let deployment_path = deployment_root.join("writer");
+        std::fs::create_dir_all(&library_path).unwrap();
+        std::fs::create_dir_all(&deployment_root).unwrap();
+        std::fs::write(library_path.join("SKILL.md"), "writer").unwrap();
+        if !crate::app_core::create_test_directory_symlink_or_skip(&library_path, &deployment_path)
+        {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        mark_managed_skill(
+            &library_root,
+            crate::managed_state::LIBRARY_OWNER_NAME,
+            &library_path,
+            "local:/tmp/writer",
+        )
+        .unwrap();
+        mark_managed_skill(
+            &deployment_root,
+            "Codex",
+            &deployment_path,
+            &format!("symlink:{}", library_path.to_string_lossy()),
+        )
+        .unwrap();
+        record_managed_root(&db, &library_root, "library", None).unwrap();
+        record_managed_root(&db, &deployment_root, "global", None).unwrap();
+        db.execute(
+            "INSERT INTO library_skills VALUES (?, 'writer', ?, 'local:/tmp/writer', 'local',
+             NULL, 'hash', 'now', 'now')",
+            params!["skill-1", library_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO skill_deployments VALUES (?, 'skill-1', ?, 'Codex', 'global', NULL,
+             'symlink', 'now')",
+            params![
+                deployment_path.to_string_lossy().to_string(),
+                library_path.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&library_path).unwrap();
+
+        let error = prune_missing_managed_installations_with(&db, |path| {
+            remove_path(path)?;
+            Err("测试注入的断链删除失败".to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("测试注入的断链删除失败"));
+        assert_eq!(std::fs::read_link(&deployment_path).unwrap(), library_path);
+        assert_eq!(list_managed_installations(&db).unwrap().len(), 2);
+        assert_eq!(
+            crate::managed_state::read_managed_state(&deployment_root)
+                .unwrap()
+                .managed_skills
+                .len(),
+            1
+        );
+
+        assert_eq!(prune_missing_managed_installations(&db).unwrap(), 2);
+        assert!(std::fs::symlink_metadata(&deployment_path).is_err());
+        for table in [
+            "managed_installations",
+            "library_skills",
+            "skill_deployments",
+        ] {
+            assert_eq!(
+                db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registered_project_root_recovers_sidecar_after_interrupted_install() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-recover-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let skill = root.join("writer");
+        register_managed_root(&db, &root, "project", Some("/tmp/project")).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "writer").unwrap();
+        mark_managed_skill(&root, "Codex", &skill, "local:/tmp/writer").unwrap();
+
+        let registered = list_managed_roots(&db).unwrap();
+        assert_eq!(registered.len(), 1);
+        record_managed_root(
+            &db,
+            &registered[0].path,
+            &registered[0].scope,
+            registered[0].project_path.as_deref(),
+        )
+        .unwrap();
+
+        let recovered = find_managed_installation(&db, &skill).unwrap().unwrap();
+        assert_eq!(recovered.skill.scope.as_deref(), Some("project"));
+        assert_eq!(
+            recovered.skill.project_path.as_deref(),
+            Some("/tmp/project")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_management_requires_registry_or_sidecar() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-owner-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let skill = root.join("writer");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "writer").unwrap();
+
+        assert!(!is_explicitly_managed(&db, &skill).unwrap());
+        mark_managed_skill(&root, "Codex", &skill, "local:/tmp/writer").unwrap();
+        assert!(is_explicitly_managed(&db, &skill).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refreshes_registry_hash_and_resolved_ref() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-refresh-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let skill = root.join("writer");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "old").unwrap();
+        mark_managed_skill(&root, "Codex", &skill, "example/skills").unwrap();
+        record_managed_root(&db, &root, "global", None).unwrap();
+        let old_hash = find_managed_installation(&db, &skill)
+            .unwrap()
+            .unwrap()
+            .skill
+            .content_hash
+            .unwrap();
+        std::fs::write(skill.join("SKILL.md"), "new").unwrap();
+
+        assert!(refresh_managed_installation(&db, &skill, Some("abc123")).unwrap());
+
+        let installation = find_managed_installation(&db, &skill).unwrap().unwrap();
+        assert_ne!(
+            installation.skill.content_hash.as_deref(),
+            Some(old_hash.as_str())
+        );
+        assert_eq!(installation.skill.resolved_ref.as_deref(), Some("abc123"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn destructive_operations_reject_managed_content_drift() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-drift-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let skill = root.join("writer");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "original").unwrap();
+        mark_managed_skill(&root, "Codex", &skill, "local:/tmp/writer").unwrap();
+        record_managed_root(&db, &root, "global", None).unwrap();
+        assert!(verify_managed_content_unchanged(&db, &skill).is_ok());
+
+        std::fs::write(skill.join("SKILL.md"), "changed").unwrap();
+
+        let error = verify_managed_content_unchanged(&db, &skill).unwrap_err();
+        assert!(error.contains("偏离安装时状态"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_checkpoint_restores_registry_origin_tags_and_sidecar() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-checkpoint-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let skill = root.join("writer");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "writer").unwrap();
+        mark_managed_skill(&root, "Codex", &skill, "local:/old/writer").unwrap();
+        record_managed_root(&db, &root, "global", None).unwrap();
+        let key = skill.to_string_lossy().to_string();
+        db.execute(
+            "INSERT INTO skill_origin_meta VALUES (?, 'git', 'old/repo', 'old/repo', 'main',
+             'old-ref', '', 'current', '', 0, NULL, NULL, 1)",
+            [&key],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO skill_tags (skill_path, tags, tags_json) VALUES (?, '', '[\"old\"]')",
+            [&key],
+        )
+        .unwrap();
+        let checkpoint =
+            ManagedMetadataCheckpoint::capture(&db, std::slice::from_ref(&skill)).unwrap();
+
+        mark_managed_skill(&root, "Codex", &skill, "local:/new/writer").unwrap();
+        db.execute(
+            "UPDATE managed_installations SET source = 'new/repo' WHERE skill_path = ?",
+            [&key],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE skill_origin_meta SET origin_locator = 'new/repo' WHERE skill_path = ?",
+            [&key],
+        )
+        .unwrap();
+        db.execute("DELETE FROM skill_tags WHERE skill_path = ?", [&key])
+            .unwrap();
+
+        checkpoint.restore(&db).unwrap();
+
+        assert_eq!(
+            find_managed_installation(&db, &skill)
+                .unwrap()
+                .unwrap()
+                .skill
+                .source,
+            "/old/writer"
+        );
+        assert_eq!(
+            crate::managed_state::managed_state_origin(&root, &skill)
+                .unwrap()
+                .as_deref(),
+            Some("local:/old/writer")
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT origin_locator FROM skill_origin_meta WHERE skill_path = ?",
+                [&key],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "old/repo"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT tags_json FROM skill_tags WHERE skill_path = ?",
+                [&key],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "[\"old\"]"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_restores_sidecar_when_database_delete_fails() {
+        let db = database();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-managed-cleanup-failure-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let skill = root.join("writer");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "writer").unwrap();
+        mark_managed_skill(&root, "Codex", &skill, "local:/tmp/writer").unwrap();
+        record_managed_root(&db, &root, "global", None).unwrap();
+        let key = skill.to_string_lossy().to_string();
+        db.execute(
+            "INSERT INTO skill_origin_meta VALUES (?, 'local', '/tmp/writer', '/tmp/writer', '',
+             '', '', 'current', '', 0, NULL, NULL, 1)",
+            [&key],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO skill_tags (skill_path, tags, tags_json) VALUES (?, '', '[\"old\"]')",
+            [&key],
+        )
+        .unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_managed_delete
+             BEFORE DELETE ON managed_installations
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced delete failure');
+             END;",
+        )
+        .unwrap();
+
+        let error = cleanup_skill_metadata(&db, &skill).unwrap_err();
+
+        assert!(error.contains("forced delete failure"));
+        assert!(crate::managed_state::is_managed_by_state(&root, &skill).unwrap());
+        assert!(find_managed_installation(&db, &skill).unwrap().is_some());
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM skill_origin_meta WHERE skill_path = ?",
+                [&key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM skill_tags WHERE skill_path = ?",
+                [&key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(skill.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

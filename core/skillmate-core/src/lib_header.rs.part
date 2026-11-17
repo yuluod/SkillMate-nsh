@@ -1,0 +1,98 @@
+﻿//! SkillMate 核心:不含 UI 的业务库(库存扫描、统一技能库、安装/接管/停用的事务
+//! 与来源追踪)。自 Tauri 版 SkillMate 移植:前端命令壳层留在各宿主应用,
+//! 本 crate 只保留纯业务函数与领域类型。
+
+pub mod app_core;
+pub mod claude_marketplace;
+pub mod cli;
+pub mod database;
+pub mod finding_review;
+pub mod git_backup;
+pub mod install_policy;
+pub mod library_config;
+pub mod library_manifest;
+pub mod managed_installation;
+pub mod managed_state;
+pub mod market;
+pub mod operation_coordinator;
+pub mod operation_plan;
+pub mod organization_commands;
+pub mod project_inspection;
+pub mod scenario_manifest;
+pub mod skill_adoption;
+pub mod skill_doctor;
+pub mod skill_drift;
+pub mod skill_install;
+pub mod skill_install_source;
+pub mod skill_inventory;
+pub mod skill_library;
+pub mod skill_materialization;
+pub mod skill_model;
+pub mod skill_orchestration;
+pub mod skill_origin;
+pub mod skill_package;
+pub mod skill_profile;
+pub mod skill_reconcile;
+pub mod skill_structure;
+pub mod skill_trash;
+pub mod skillmate_manifest;
+pub mod update_preview;
+
+use app_core::{
+    assistant_root_by_name, expand_path, managed_skill_roots, now_ms, project_skill_root_by_name,
+};
+use database::remember_database_initialization_error;
+use install_policy::{
+    evaluate_install_policy, load_install_policy, policy_failure_decision, InstallPolicyConfig,
+    InstallPolicyInput,
+};
+use managed_installation::{
+    find_managed_installation, list_managed_installations, record_managed_path,
+    refresh_managed_installation,
+};
+use operation_coordinator::{initialize_managed_database, run_exclusive_operation};
+use operation_plan::verify_operation_plan;
+use organization_commands::{Scenario, Tag};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use skill_install::{
+    install_selected_local_package_at_digest, installable_content_fingerprint,
+    preview_selected_local_install_source, seal_install_preview, InstallPreview, InstallResult,
+    PreparedGitInstall,
+};
+use skill_install_source::{install_target_name, is_git_install_source};
+use skill_library::{
+    add_deployment_to_preview, copy_origin_to_deployment, deploy_library_skill,
+    is_library_skill_path, library_root, library_skill_id, register_deployment,
+    register_library_skill, reuse_library_preview,
+};
+use skill_origin::{
+    save_installed_git_meta as save_git_origin_meta, save_installed_local_meta as save_local_origin_meta,
+};
+use skill_package::PackageDetection;
+pub use skill_reconcile::ReconcileTransaction;
+use skill_structure::SkillStructureInfo;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+// 仅供 lib.rs 内联测试通过 `use super::*` 引用的再导出。
+#[cfg(test)]
+use install_policy::save_install_policy;
+#[cfg(test)]
+use library_manifest::{build_library_export, merge_imported_library, preview_imported_library};
+#[cfg(test)]
+use managed_installation::{
+    cleanup_skill_metadata, is_explicitly_managed, verify_managed_content_unchanged,
+};
+#[cfg(test)]
+use project_inspection::inspect_project_skills;
+#[cfg(test)]
+use skill_inventory::scan_all_assistants;
+#[cfg(test)]
+use skill_library::scan_unassigned_library_skills;
+#[cfg(test)]
+use organization_commands::get_scenarios_from_db;
+#[cfg(test)]
+use scenario_manifest::{merge_scenario_manifest, preview_scenario_manifest};
+#[cfg(test)]
+use skill_orchestration::{build_current_manifest, preview_manifest};

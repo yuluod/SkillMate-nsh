@@ -1,0 +1,36 @@
+{
+  "cssVars": {
+    "light": {
+      "background": "#efece2",
+      "foreground": "#20263a",
+      "card": "#faf8f0",
+      "card-foreground": "#20263a",
+      "muted": "#faf8f0",
+      "muted-foreground": "#5d5f72",
+      "primary": "#2450c4",
+      "primary-foreground": "#ffffff",
+      "accent": "#1b3f9e",
+      "border": "#c6bfa9",
+      "sidebar": "#faf8f0",
+      "success": "#25714c",
+      "warn": "#8f5a10",
+      "error": "#b23327"
+    },
+    "dark": {
+      "background": "#151821",
+      "foreground": "#ede8db",
+      "card": "#1b1f2a",
+      "card-foreground": "#ede8db",
+      "muted": "#1b1f2a",
+      "muted-foreground": "#94917f",
+      "primary": "#7d9ff2",
+      "primary-foreground": "#151821",
+      "accent": "#93b0f5",
+      "border": "#333949",
+      "sidebar": "#1b1f2a",
+      "success": "#5cba8e",
+      "warn": "#d9a04e",
+      "error": "#e0695b"
+    }
+  }
+}

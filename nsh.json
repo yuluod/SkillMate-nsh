@@ -1,0 +1,16 @@
+{
+  "name": "SkillMate",
+  "id": "io.github.yuluod.skillmate.nsh",
+  "version": "0.1.0",
+  "build": 1,
+  "rust": ".",
+  "theme": "theme-ledger.json",
+  "singleInstance": true,
+  "locales": ["zh-CN", "en"],
+  "window": {
+    "width": 1000,
+    "height": 700,
+    "minWidth": 800,
+    "minHeight": 500
+  }
+}

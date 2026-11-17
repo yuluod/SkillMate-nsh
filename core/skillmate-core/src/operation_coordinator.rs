@@ -1,0 +1,625 @@
+﻿use crate::app_core::{assistant_definitions, is_managed_skill_path, managed_skill_roots};
+use crate::database::{
+    create_db_connection, data_directory, data_directory_path, open_db_connection,
+    open_readonly_db_connection,
+};
+use crate::managed_installation::{
+    backfill_managed_roots, find_managed_installation, list_managed_roots,
+    migrate_managed_installation_fingerprints, prune_missing_managed_installations,
+    record_managed_root, register_managed_root,
+};
+use crate::skill_library::{copy_origin_to_deployment, resolve_library_path};
+use crate::skill_origin::{
+    persist_prepared_skill_probe, prepare_skill_probe, prepare_skill_probes, SkillSyncInfo,
+};
+use crate::skill_reconcile::recover_pending_transactions;
+use rusqlite::Connection;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::{Path, PathBuf};
+use std::sync::{LockResult, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+static OPERATION_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) type SkillCheckResult = (String, Result<SkillSyncInfo, String>);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StartupMaintenanceReport {
+    pub(crate) recovered_transactions: usize,
+    pub(crate) refreshed_installations: usize,
+    pub(crate) pruned_installations: usize,
+    pub(crate) warnings: Vec<String>,
+}
+
+struct OperationGuard {
+    // Keep the lock file on disk: removing it could let another process lock a new inode.
+    // Closing the handle releases the OS lock, including after a process crash.
+    _file: File,
+    _thread: MutexGuard<'static, ()>,
+}
+
+fn acquire_operation_lock() -> Result<OperationGuard, String> {
+    let thread = map_operation_lock(OPERATION_LOCK.lock())?;
+    let file = acquire_file_lock(
+        &data_directory()?.join("operations.lock"),
+        Duration::from_secs(30),
+    )?;
+    Ok(OperationGuard {
+        _file: file,
+        _thread: thread,
+    })
+}
+
+/// 只读入口的并发协调：锁文件已存在时照常加锁（不加 create 语义即不新增文件），
+/// 锁文件不存在说明应用从未初始化，没有可竞争的写操作，直接放行且不创建任何东西。
+fn acquire_readonly_operation_lock() -> Result<Option<OperationGuard>, String> {
+    let thread = map_operation_lock(OPERATION_LOCK.lock())?;
+    let Some(file) = acquire_readonly_lock_at(&data_directory_path().join("operations.lock"))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(OperationGuard {
+        _file: file,
+        _thread: thread,
+    }))
+}
+
+pub(crate) fn acquire_readonly_lock_at(path: &Path) -> Result<Option<File>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    acquire_file_lock(path, Duration::from_secs(30)).map(Some)
+}
+
+fn acquire_file_lock(path: &Path, timeout: Duration) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| format!("无法打开操作锁 {}: {error}", path.display()))?;
+    let start = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if start.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err("另一个 SkillMate 窗口或 CLI 正在操作，请稍后重试".to_string());
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(format!("无法取得跨进程操作锁: {error}"));
+            }
+        }
+    }
+}
+
+fn map_operation_lock<T>(lock: LockResult<T>) -> Result<T, String> {
+    lock.map_err(|_| "同步锁已中毒，请重启应用后重试".to_string())
+}
+
+pub fn run_exclusive_operation<T, F>(operation: F) -> Result<T, String>
+where
+    F: FnOnce(&Connection) -> Result<T, String>,
+{
+    run_exclusive_operation_with(
+        acquire_operation_lock,
+        open_db_connection,
+        |db| {
+            let recovered = recover_pending_transactions(db)
+                .map_err(|error| format!("恢复未完成事务失败，已阻止本次操作: {error}"))?;
+            let (_, warnings) = migrate_managed_installation_fingerprints(db)
+                .map_err(|error| format!("迁移内容指纹失败，已阻止本次操作: {error}"))?;
+            for warning in warnings {
+                eprintln!("内容指纹迁移: {warning}");
+            }
+            Ok(recovered)
+        },
+        operation,
+    )
+}
+
+/// 只读操作入口：与写操作共用同一把跨进程锁做并发协调，
+/// 但跳过事务恢复、指纹迁移与安装清理等维护写，供 doctor 等诊断命令使用。
+pub fn run_readonly_operation<T, F>(operation: F) -> Result<T, String>
+where
+    F: FnOnce(&Connection) -> Result<T, String>,
+{
+    run_readonly_operation_with(
+        acquire_readonly_operation_lock,
+        open_readonly_db_connection,
+        operation,
+    )
+}
+
+/// 可注入的只读入口：测试替换锁与数据库来源后，仍走与线上一致的组装路径。
+pub fn run_readonly_operation_with<T, G, L, D, F>(
+    acquire_lock: L,
+    open_db: D,
+    operation: F,
+) -> Result<T, String>
+where
+    L: FnOnce() -> Result<G, String>,
+    D: FnOnce() -> Result<Connection, String>,
+    F: FnOnce(&Connection) -> Result<T, String>,
+{
+    run_exclusive_operation_with(acquire_lock, open_db, |_| Ok(0), operation)
+}
+
+fn run_exclusive_operation_with<T, G, L, D, R, F>(
+    acquire_lock: L,
+    open_db: D,
+    recover: R,
+    operation: F,
+) -> Result<T, String>
+where
+    L: FnOnce() -> Result<G, String>,
+    D: FnOnce() -> Result<Connection, String>,
+    R: FnOnce(&Connection) -> Result<usize, String>,
+    F: FnOnce(&Connection) -> Result<T, String>,
+{
+    let _guard = acquire_lock()?;
+    let db = open_db()?;
+    recover(&db)?;
+    operation(&db)
+}
+
+pub fn is_known_skill_path(db: &Connection, path: &Path) -> Result<bool, String> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    if is_managed_skill_path(path, &managed_skill_roots()) {
+        return Ok(true);
+    }
+    Ok(find_managed_installation(db, path)?.is_some())
+}
+
+pub fn check_skill_update(path: &Path, force: bool) -> Result<SkillSyncInfo, String> {
+    let initial_db = open_db_connection()?;
+    let requested_path = path.to_path_buf();
+    let probe_path = resolve_probe_path(&initial_db, &requested_path)?;
+    let prepared = prepare_skill_probe(&initial_db, &probe_path, force)?;
+    drop(initial_db);
+
+    run_exclusive_operation(move |db| {
+        ensure_known_skill_path(db, &requested_path)?;
+        ensure_known_skill_path(db, prepared.path())?;
+        let info = persist_prepared_skill_probe(db, prepared)?;
+        if requested_path != probe_path {
+            copy_origin_to_deployment(db, &probe_path, &requested_path)?;
+        }
+        Ok(info)
+    })
+}
+
+pub fn check_skill_updates(
+    paths: &[PathBuf],
+    force: bool,
+) -> Result<Vec<SkillCheckResult>, String> {
+    let initial_db = open_db_connection()?;
+    let mut valid_requests = Vec::new();
+    let mut invalid = Vec::new();
+    for path in paths {
+        match resolve_probe_path(&initial_db, path) {
+            Ok(probe_path) => valid_requests.push((path.clone(), probe_path)),
+            Err(error) => invalid.push((
+                path.to_string_lossy().to_string(),
+                Err(format!("检查受管路径失败: {}", error)),
+            )),
+        }
+    }
+    let mut seen = HashSet::new();
+    let probe_paths = valid_requests
+        .iter()
+        .map(|(_, probe_path)| probe_path.clone())
+        .filter(|probe_path| seen.insert(probe_path.clone()))
+        .collect::<Vec<_>>();
+    let prepared = prepare_skill_probes(&initial_db, &probe_paths, force);
+    drop(initial_db);
+
+    run_exclusive_operation(move |db| {
+        let probe_results = prepared
+            .into_iter()
+            .map(|(path, result)| {
+                let result = result.and_then(|prepared| {
+                    ensure_known_skill_path(db, prepared.path())?;
+                    persist_prepared_skill_probe(db, prepared)
+                });
+                (PathBuf::from(path), result)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut results = valid_requests
+            .into_iter()
+            .map(|(requested_path, probe_path)| {
+                let result = probe_results
+                    .get(&probe_path)
+                    .cloned()
+                    .unwrap_or_else(|| Err("未生成 Skill 检查结果".to_string()));
+                let result = result.and_then(|info| {
+                    ensure_known_skill_path(db, &requested_path)?;
+                    if requested_path != probe_path {
+                        copy_origin_to_deployment(db, &probe_path, &requested_path)?;
+                    }
+                    Ok(info)
+                });
+                (requested_path.to_string_lossy().to_string(), result)
+            })
+            .collect::<Vec<_>>();
+        results.extend(invalid);
+        Ok(results)
+    })
+}
+
+fn resolve_probe_path(db: &Connection, requested_path: &Path) -> Result<PathBuf, String> {
+    ensure_known_skill_path(db, requested_path)?;
+    let probe_path = resolve_library_path(db, requested_path)?;
+    ensure_known_skill_path(db, &probe_path)?;
+    Ok(probe_path)
+}
+
+pub fn initialize_managed_database() -> Result<(Connection, StartupMaintenanceReport), String>
+{
+    let _guard = acquire_operation_lock()?;
+    // Migration, recovery and registry maintenance must share the same process lock.
+    let db = create_db_connection()?;
+    let global_roots = assistant_definitions()
+        .iter()
+        .flat_map(|assistant| assistant.global_discovery_roots())
+        .collect::<Vec<_>>();
+    let report = run_startup_maintenance_with(&db, &global_roots, || {
+        let recovered = recover_pending_transactions(&db)?;
+        let (_, warnings) = migrate_managed_installation_fingerprints(&db)?;
+        for warning in warnings {
+            eprintln!("内容指纹迁移: {warning}");
+        }
+        Ok(recovered)
+    })?;
+    Ok((db, report))
+}
+
+fn run_startup_maintenance_with<F>(
+    db: &Connection,
+    global_roots: &[PathBuf],
+    recover: F,
+) -> Result<StartupMaintenanceReport, String>
+where
+    F: FnOnce() -> Result<usize, String>,
+{
+    let mut report = StartupMaintenanceReport {
+        recovered_transactions: recover()?,
+        ..StartupMaintenanceReport::default()
+    };
+
+    for root in global_roots {
+        if let Err(error) = register_managed_root(db, root, "global", None) {
+            report.warnings.push(format!(
+                "受管根目录登记失败 {}: {}",
+                root.to_string_lossy(),
+                error
+            ));
+        }
+    }
+    if let Err(error) = backfill_managed_roots(db) {
+        report
+            .warnings
+            .push(format!("受管根目录迁移失败: {}", error));
+    }
+    match list_managed_roots(db) {
+        Ok(roots) => {
+            for root in roots {
+                match record_managed_root(db, &root.path, &root.scope, root.project_path.as_deref())
+                {
+                    Ok(count) => report.refreshed_installations += count,
+                    Err(error) => report.warnings.push(format!(
+                        "受管安装索引恢复失败 {}: {}",
+                        root.path.to_string_lossy(),
+                        error
+                    )),
+                }
+            }
+        }
+        Err(error) => report
+            .warnings
+            .push(format!("读取受管根目录失败: {}", error)),
+    }
+    match prune_missing_managed_installations(db) {
+        Ok(count) => report.pruned_installations = count,
+        Err(error) => report
+            .warnings
+            .push(format!("清理失效受管安装索引失败: {}", error)),
+    }
+    Ok(report)
+}
+
+fn ensure_known_skill_path(db: &Connection, path: &Path) -> Result<(), String> {
+    if is_known_skill_path(db, path)? {
+        Ok(())
+    } else {
+        Err("检查期间 Skill 已被删除或不再受管，请刷新后重试".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_state::{content_fingerprint, mark_managed_skill};
+    use std::fs;
+
+    #[test]
+    fn file_lock_child() {
+        let Some(root) = std::env::var_os("SKILLMATE_LOCK_TEST_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var("SKILLMATE_LOCK_TEST_MODE").unwrap();
+        if mode == "exit-with-lock" {
+            let _guard = acquire_file_lock(&root.join("operations.lock"), Duration::ZERO).unwrap();
+            // Exit without Rust destructors to exercise OS cleanup after an abrupt exit.
+            std::process::exit(0);
+        }
+        let result = run_exclusive_operation_with(
+            || acquire_file_lock(&root.join("operations.lock"), Duration::from_millis(100)),
+            || Connection::open_in_memory().map_err(|error| error.to_string()),
+            |_| {
+                fs::write(root.join("recovery-ran"), "recovered").unwrap();
+                Ok(1)
+            },
+            |_| Ok(()),
+        );
+        if mode == "blocked" {
+            assert!(result.unwrap_err().contains("正在操作"));
+            assert!(!root.join("recovery-ran").exists());
+        } else {
+            result.unwrap();
+            assert!(root.join("recovery-ran").exists());
+        }
+    }
+
+    #[test]
+    fn process_lock_blocks_recovery_and_releases_after_exit() {
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-process-lock-{}-{}",
+            std::process::id(),
+            crate::app_core::generate_id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let child = |mode: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operation_coordinator::tests::file_lock_child",
+                    "--nocapture",
+                ])
+                .env("SKILLMATE_LOCK_TEST_ROOT", &root)
+                .env("SKILLMATE_LOCK_TEST_MODE", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let guard = acquire_file_lock(&root.join("operations.lock"), Duration::ZERO).unwrap();
+        child("blocked");
+        assert!(!root.join("recovery-ran").exists());
+        drop(guard);
+        child("exit-with-lock");
+        child("acquired");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn startup_database() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE managed_roots (
+                root_path TEXT PRIMARY KEY, scope TEXT NOT NULL,
+                project_path TEXT, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE managed_installations (
+                skill_path TEXT PRIMARY KEY, assistant TEXT NOT NULL, source TEXT NOT NULL,
+                source_kind TEXT NOT NULL, target_name TEXT NOT NULL, scope TEXT NOT NULL,
+                install_mode TEXT NOT NULL, project_path TEXT, tracking_ref TEXT, subdir TEXT,
+                resolved_ref TEXT, content_hash TEXT, installed_at TEXT NOT NULL
+            );
+            CREATE TABLE skill_origin_meta (skill_path TEXT PRIMARY KEY);
+            CREATE TABLE skill_tags (skill_path TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn startup_recovers_files_before_refreshing_managed_fingerprint() {
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-startup-order-{}-{}",
+            std::process::id(),
+            crate::app_core::generate_id()
+        ));
+        let skill = root.join("writer");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "old content").unwrap();
+        mark_managed_skill(&root, "Codex", &skill, "local:/tmp/writer").unwrap();
+        let db = startup_database();
+        register_managed_root(&db, &root, "global", None).unwrap();
+        record_managed_root(&db, &root, "global", None).unwrap();
+        let old_hash = content_fingerprint(&skill).unwrap();
+
+        fs::write(skill.join("SKILL.md"), "temporary new content").unwrap();
+        let temporary_hash = content_fingerprint(&skill).unwrap();
+        let report = run_startup_maintenance_with(&db, &[], || {
+            assert_eq!(content_fingerprint(&skill).unwrap(), temporary_hash);
+            fs::write(skill.join("SKILL.md"), "old content").map_err(|error| error.to_string())?;
+            Ok(1)
+        })
+        .unwrap();
+
+        let stored_hash: String = db
+            .query_row(
+                "SELECT content_hash FROM managed_installations WHERE skill_path = ?",
+                [skill.to_string_lossy().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(report.recovered_transactions, 1);
+        assert_eq!(report.refreshed_installations, 1);
+        assert_eq!(stored_hash, old_hash);
+        assert_ne!(stored_hash, temporary_hash);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_entry_does_not_make_a_missing_path_probeable() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE managed_installations (
+                skill_path TEXT PRIMARY KEY, assistant TEXT NOT NULL, source TEXT NOT NULL,
+                source_kind TEXT NOT NULL, target_name TEXT NOT NULL, scope TEXT NOT NULL,
+                install_mode TEXT NOT NULL, project_path TEXT, tracking_ref TEXT, subdir TEXT,
+                resolved_ref TEXT, content_hash TEXT, installed_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "skillmate-missing-coordinator-path-{}-{}",
+            std::process::id(),
+            crate::app_core::now_ms()
+        ));
+        db.execute(
+            "INSERT INTO managed_installations VALUES (?, 'Codex', 'source', 'local', 'writer',
+             'global', 'copy', NULL, NULL, NULL, NULL, NULL, 'now')",
+            [path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        assert!(!is_known_skill_path(&db, &path).unwrap());
+    }
+
+    #[test]
+    fn update_probe_resolves_deployment_to_library_copy() {
+        let db = startup_database();
+        db.execute_batch(
+            "CREATE TABLE library_skills (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, library_path TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL, source_kind TEXT NOT NULL, resolved_ref TEXT,
+                content_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE skill_deployments (
+                target_path TEXT PRIMARY KEY, skill_id TEXT NOT NULL, library_path TEXT NOT NULL,
+                assistant TEXT NOT NULL, scope TEXT NOT NULL, project_path TEXT,
+                deploy_mode TEXT NOT NULL, deployed_at TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "skillmate-update-probe-{}-{}",
+            std::process::id(),
+            crate::app_core::generate_id()
+        ));
+        let library_path = root.join("library/writer");
+        let deployment_path = root.join("deployments/writer");
+        fs::create_dir_all(&library_path).unwrap();
+        fs::create_dir_all(deployment_path.parent().unwrap()).unwrap();
+        fs::write(library_path.join("SKILL.md"), "writer").unwrap();
+        if !crate::app_core::create_test_directory_symlink_or_skip(&library_path, &deployment_path)
+        {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        for (path, assistant, scope) in [
+            (
+                &library_path,
+                crate::managed_state::LIBRARY_OWNER_NAME,
+                "library",
+            ),
+            (&deployment_path, "Codex", "global"),
+        ] {
+            db.execute(
+                "INSERT INTO managed_installations VALUES (?, ?, '/tmp/writer', 'git', 'writer',
+                 ?, 'copy', NULL, NULL, NULL, NULL, 'hash', 'now')",
+                rusqlite::params![path.to_string_lossy().to_string(), assistant, scope],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO skill_deployments VALUES (?, 'skill-1', ?, 'Codex', 'global', NULL,
+             'symlink', 'now')",
+            rusqlite::params![
+                deployment_path.to_string_lossy().to_string(),
+                library_path.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_probe_path(&db, &deployment_path).unwrap(),
+            library_path
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn poisoned_operation_lock_maps_to_recoverable_error() {
+        let lock = Mutex::new(());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = lock.lock().unwrap();
+            panic!("poison test lock");
+        });
+
+        let error = map_operation_lock(lock.lock()).unwrap_err();
+
+        assert_eq!(error, "同步锁已中毒，请重启应用后重试");
+    }
+
+    #[test]
+    fn exclusive_operation_recovers_before_running() {
+        let steps = std::cell::RefCell::new(Vec::new());
+
+        let result = run_exclusive_operation_with(
+            || {
+                steps.borrow_mut().push("lock");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("database");
+                Connection::open_in_memory().map_err(|error| error.to_string())
+            },
+            |_| {
+                steps.borrow_mut().push("recover");
+                Ok(1)
+            },
+            |_| {
+                steps.borrow_mut().push("operation");
+                Ok("done")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            *steps.borrow(),
+            vec!["lock", "database", "recover", "operation"]
+        );
+    }
+
+    #[test]
+    fn exclusive_operation_stops_when_recovery_fails() {
+        let operation_ran = std::cell::Cell::new(false);
+
+        let error = run_exclusive_operation_with(
+            || Ok(()),
+            || Connection::open_in_memory().map_err(|error| error.to_string()),
+            |_| Err("恢复未完成事务失败，已阻止本次操作: journal 损坏".to_string()),
+            |_| {
+                operation_ran.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "恢复未完成事务失败，已阻止本次操作: journal 损坏");
+        assert!(!operation_ran.get());
+    }
+}
