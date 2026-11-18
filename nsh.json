@@ -5,6 +5,7 @@
   "build": 1,
   "rust": ".",
   "theme": "theme-ledger.json",
+  "icon": { "windows": "app-icon.png" },
   "singleInstance": true,
   "locales": ["zh-CN", "en"],
   "window": {
