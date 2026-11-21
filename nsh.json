@@ -7,6 +7,7 @@
   "theme": "theme-ledger.json",
   "icon": { "windows": "app-icon.png" },
   "singleInstance": true,
+  "updater": { "github": "yuluod/SkillMate-nsh" },
   "locales": ["zh-CN", "en"],
   "window": {
     "defaultSize": { "width": 1000, "height": 700 },

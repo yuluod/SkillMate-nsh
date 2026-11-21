@@ -484,6 +484,109 @@ export async function applyDriftSync(): Promise<void> {
   }
 }
 
+// ---- 更新回滚流程(v0.1.2) ----
+export const rollbackState = signal<{ path: string; name: string; preview: UpdatePreview } | null>(null);
+export const rollbackApplying = signal(false);
+
+export async function openRollbackPreview(path: string, name: string): Promise<void> {
+  try {
+    const preview = await api.previewSkillRollback(path);
+    rollbackState.set({ path, name, preview });
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
+export async function applyRollback(): Promise<void> {
+  const state = rollbackState();
+  if (!state || rollbackApplying() || !state.preview.canApply) return;
+  rollbackApplying.set(true);
+  try {
+    const message = await api.applySkillRollback(state.path, state.preview.planToken);
+    rollbackState.set(null);
+    showToast(message, "info");
+    await refresh();
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), "error");
+  } finally {
+    rollbackApplying.set(false);
+  }
+}
+
+// ---- 模板创建 Skill ----
+export const templateOpen = signal(false);
+export const templateNameDraft = signal("");
+export const templateDescDraft = signal("");
+export const templateErrors = signal<string[]>([]);
+export const templateBusy = signal(false);
+
+export function openTemplateCreate(): void {
+  templateNameDraft.set("");
+  templateDescDraft.set("");
+  templateErrors.set([]);
+  templateOpen.set(true);
+}
+
+export async function validateTemplateDraft(): Promise<void> {
+  const result = await api.validateSkillDraft(templateNameDraft().trim(), templateDescDraft().trim());
+  templateErrors.set(result.errors);
+  return result.ok ? undefined : Promise.reject(new Error(result.errors.join("\n")));
+}
+
+export async function createTemplateSkill(): Promise<void> {
+  if (templateBusy() || !templateNameDraft().trim()) return;
+  templateBusy.set(true);
+  templateErrors.set([]);
+  try {
+    const result = await api.validateSkillDraft(templateNameDraft().trim(), templateDescDraft().trim());
+    if (!result.ok) {
+      templateErrors.set(result.errors);
+      return;
+    }
+    const path = await api.createLibrarySkill(templateNameDraft().trim(), templateDescDraft().trim());
+    templateOpen.set(false);
+    showToast(tt("template.created", "已从模板创建") + "\n" + path, "info");
+    await refresh();
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error), "error");
+  } finally {
+    templateBusy.set(false);
+  }
+}
+
+// ---- 忽略标记(v0.1.2) ----
+// 清单本体在 state.ignoredPaths(refresh 时同步);这里只提供动作与筛选。
+
+export function toggleIgnoreConfirm(path: string, name: string, ignored: boolean): void {
+  requestConfirm({
+    title: ignored ? tt("skills.unignoreTitle", "取消忽略") : tt("skills.ignoreTitle", "忽略"),
+    body: ignored
+      ? tt("skills.unignoreBody", "重新显示该条目") + "\n" + name
+      : tt("skills.ignoreBody", "从默认列表隐藏(不删除文件)") + "\n" + name,
+    confirmLabel: ignored ? tt("skills.unignoreTitle", "取消忽略") : tt("skills.ignoreTitle", "忽略"),
+    onConfirm: async () => {
+      await api.setSkillIgnore(path, !ignored);
+      showToast(ignored ? tt("skills.unignored", "已取消忽略") : tt("skills.ignored", "已忽略"));
+      await refresh();
+    },
+  });
+}
+
+// 筛选态:默认隐藏已忽略条目;showIgnoredOnly 打开时只显示已忽略条目。
+export const showIgnoredOnly = signal(false);
+
+export function toggleShowIgnored(): void {
+  showIgnoredOnly.set(!showIgnoredOnly());
+}
+
+export function filterByIgnored(rows: Record<string, any>[], ignored: Set<string>): Record<string, any>[] {
+  const showOnly = showIgnoredOnly();
+  if (!showOnly) {
+    return rows.filter((row) => !ignored.has(String(row.path)));
+  }
+  return rows.filter((row) => ignored.has(String(row.path)));
+}
+
 // ---- 市场发现 ----
 export const marketOpen = signal(false);
 export const marketQuery = signal("");

@@ -3,10 +3,11 @@
 import { mount, Scroll, Text, View, token } from "nsh";
 import { t } from "nsh/i18n";
 import { skinStyle } from "./src/theme";
-import { dashboard, loading, refresh, skin, view, type ViewId } from "./src/state";
+import { dashboard, focusSearch, loading, refresh, skin, view, type ViewId } from "./src/state";
 import { buildUniqueSkillInventory, buildSkillCardView } from "./src/lib/inventory";
 import { AppLogo, Icon } from "./src/components/Icon";
 import { Overlays } from "./src/components/Overlays";
+import { setupTray } from "./src/tray";
 import { DashboardView } from "./src/screens/DashboardView";
 import { SkillsView } from "./src/screens/SkillsView";
 import { AssistantsView, ScenariosView, SettingsView } from "./src/screens/SimpleViews";
@@ -134,9 +135,27 @@ function renderContent() {
   return <SettingsView />;
 }
 
+// 应用内快捷键:Alt+1~5 切视图,Ctrl+K 跳到技能库并聚焦搜索(与原版一致)。
+// 挂根容器;keydown 会从聚焦子视图冒泡上来。
+function handleKeyDown(e: { key: string; modifiers: { alt: boolean; control: boolean } }): void {
+  const viewIds: ViewId[] = ["dashboard", "skills", "assistants", "scenarios", "settings"];
+  if (e.modifiers.alt && e.key >= "1" && e.key <= "5") {
+    view.set(viewIds[Number(e.key) - 1]);
+    return;
+  }
+  if (e.modifiers.control && (e.key === "k" || e.key === "K")) {
+    focusSearch.set(true);
+    view.set("skills");
+  }
+}
+
 function App() {
   return (
-    <View style={{ flex: 1, backgroundColor: token("background") }}>
+    <View
+      style={{ flex: 1, backgroundColor: token("background") }}
+      focusable={true}
+      onKeyDown={handleKeyDown as never}
+    >
       <View
         style={{
           flexDirection: "row",
@@ -189,3 +208,4 @@ function App() {
 }
 
 mount(App);
+setupTray();

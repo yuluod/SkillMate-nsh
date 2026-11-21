@@ -1,4 +1,4 @@
-﻿// 全局应用状态:signal 即状态,动作函数负责数据装载与选择。
+// 全局应用状态:signal 即状态,动作函数负责数据装载与选择。
 // 注意:NSH 的响应式只追踪 JSX 表达式求值链上的 signal 读取,
 // 组件函数体是纯 setup——所有读取必须发生在从 JSX 调用的渲染函数里。
 import { signal } from "nsh";
@@ -21,6 +21,9 @@ export const detail = signal<{ readme: string; validation: Record<string, any> |
 export const detailLoading = signal(false);
 export const tags = signal<Record<string, any>[]>([]);
 export const scenarios = signal<Record<string, any>[]>([]);
+export const ignoredPaths = signal<Set<string>>(new Set());
+// Ctrl+K 时置 true;技能库搜索框挂 autoFocus 消费后复位。
+export const focusSearch = signal(false);
 
 const storedSkin = persisted("skillmate-skin");
 const storedMode = persisted("skillmate-theme-mode");
@@ -76,6 +79,9 @@ export async function refresh(): Promise<void> {
     Library.getScenarios()
       .then((items) => scenarios.set(items as unknown as Record<string, any>[]))
       .catch(() => scenarios.set([]));
+    Library.listIgnoredSkills()
+      .then((paths) => ignoredPaths.set(new Set(paths as unknown as string[])))
+      .catch(() => undefined);
   } catch (error) {
     loadError.set(error instanceof Error ? error.message : String(error));
   } finally {
@@ -84,7 +90,6 @@ export async function refresh(): Promise<void> {
 }
 
 export async function openDetail(path: string): Promise<void> {
-  console.log("openDetail called:", path);
   selectedIdentity.set(path);
   detail.set(null);
   detailLoading.set(true);
