@@ -32,9 +32,12 @@ pub mod skill_orchestration;
 pub mod skill_origin;
 pub mod skill_package;
 pub mod skill_profile;
+pub mod skill_ignore;
 pub mod skill_reconcile;
 pub mod skill_structure;
 pub mod skill_trash;
+pub mod skill_snapshot;
+pub mod skill_template;
 pub mod skillmate_manifest;
 pub mod update_preview;
 

@@ -1,4 +1,4 @@
-use crate::app_core::generate_id;
+﻿use crate::app_core::generate_id;
 use crate::database::{database_path_key, parse_legacy_list, PathColumn};
 use crate::skill_library::resolve_library_path;
 use rusqlite::{params, Connection};
@@ -37,6 +37,20 @@ pub fn get_all_tags_from_db(db: &Connection) -> Result<Vec<Tag>, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     Ok(tags)
+}
+
+pub fn add_tag_in_db(db: &Connection, name: &str, color: &str) -> Result<Tag, String> {
+    let id = generate_id();
+    db.execute(
+        "INSERT INTO tags (id, name, color) VALUES (?, ?, ?)",
+        params![id, name, color],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Tag {
+        id,
+        name: name.to_string(),
+        color: color.to_string(),
+    })
 }
 
 pub fn update_tag_in_db(db: &Connection, tag_id: &str, name: &str, color: &str) -> Result<Tag, String> {
@@ -130,6 +144,20 @@ pub fn update_skill_tags_in_db(
     Ok("已更新".to_string())
 }
 
+pub fn set_skill_ignore_in_db(db: &Connection, skill_path: &Path, ignored: bool) -> Result<String, String> {
+    crate::skill_ignore::set_skill_ignored(db, skill_path, ignored)?;
+    Ok(if ignored {
+        "已忽略"
+    } else {
+        "已取消忽略"
+    }
+    .to_string())
+}
+
+pub fn list_ignored_skills_from_db(db: &Connection) -> Result<Vec<String>, String> {
+    crate::skill_ignore::list_ignored_skill_paths(db)
+}
+
 pub fn get_scenarios_from_db(db: &Connection) -> Result<Vec<Scenario>, String> {
     let mut statement = db
         .prepare("SELECT id, name, COALESCE(description, ''), skill_ids_json, COALESCE(skill_ids, ''), COALESCE(created_at, '') FROM scenarios")
@@ -167,20 +195,6 @@ pub fn get_scenarios_from_db(db: &Connection) -> Result<Vec<Scenario>, String> {
             },
         )
         .collect()
-}
-
-pub fn add_tag_in_db(db: &Connection, name: &str, color: &str) -> Result<Tag, String> {
-    let id = generate_id();
-    db.execute(
-        "INSERT INTO tags (id, name, color) VALUES (?, ?, ?)",
-        params![id, name, color],
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(Tag {
-        id,
-        name: name.to_string(),
-        color: color.to_string(),
-    })
 }
 
 pub fn create_scenario_in_db(
