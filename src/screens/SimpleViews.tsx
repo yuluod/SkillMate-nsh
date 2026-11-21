@@ -1,4 +1,4 @@
-// 启用位置(含项目核验)、场景(CRUD)与设置(常规/应用/数据 三组七页)。
+﻿// 启用位置(含项目核验)、场景(CRUD)与设置(常规/应用/数据 三组七页)。
 // 组件只做壳,逻辑在 render*(从 JSX 调用,signal 读取被追踪)。
 import { signal, Text, View, token } from "nsh";
 import { t } from "nsh/i18n";
@@ -227,7 +227,7 @@ export function ScenariosView() {
 }
 
 // ---- 设置:常规/应用/数据 三组 ----
-type SettingsTab = "language" | "appearance" | "backup" | "policy" | "libraryRoot" | "data" | "profiles";
+type SettingsTab = "language" | "appearance" | "backup" | "policy" | "libraryRoot" | "data" | "profiles" | "appUpdate";
 const settingsTab = signal<SettingsTab>("language");
 
 const gitDraft = signal<{ repoPath: string; remoteUrl: string; branch: string } | null>(null);
@@ -238,6 +238,123 @@ const dataImportPath = signal("");
 const manifestPath = signal("");
 const profileNameDraft = signal("");
 const profilesList = signal<Record<string, any>[]>([]);
+
+// ---- 应用更新(nsh/updater) ----
+type AppUpdateStatus = "idle" | "checking" | "current" | "available" | "downloading" | "installing" | "error";
+const appUpdateStatus = signal<AppUpdateStatus>("idle");
+const appUpdateInfo = signal<{ version: string; notes?: string | null; canInstall: boolean } | null>(null);
+const appUpdateProgress = signal<string>("");
+const appUpdateError = signal("");
+
+async function checkAppUpdate(): Promise<void> {
+  if (appUpdateStatus() === "checking" || appUpdateStatus() === "downloading") return;
+  appUpdateStatus.set("checking");
+  appUpdateError.set("");
+  try {
+    const { checkForUpdate } = await import("nsh/updater");
+    const update = await checkForUpdate({ locale: language() });
+    if (update) {
+      appUpdateInfo.set({ version: update.version, notes: update.notes ?? null, canInstall: update.canInstall });
+      appUpdateStatus.set("available");
+    } else {
+      appUpdateInfo.set(null);
+      appUpdateStatus.set("current");
+    }
+  } catch (error) {
+    appUpdateError.set(error instanceof Error ? error.message : String(error));
+    appUpdateStatus.set("error");
+  }
+}
+
+async function downloadAndInstallAppUpdate(): Promise<void> {
+  if (!appUpdateInfo()?.canInstall || appUpdateStatus() === "downloading") return;
+  appUpdateStatus.set("downloading");
+  try {
+    const { downloadUpdate, installAndRestart } = await import("nsh/updater");
+    await downloadUpdate((progress) => {
+      const text = progress.total
+        ? `${Math.min(100, Math.round((progress.received / progress.total) * 100))}%`
+        : `${Math.round(progress.received / 1024)} KB`;
+      appUpdateProgress.set(text);
+    });
+    appUpdateStatus.set("installing");
+    await installAndRestart();
+  } catch (error) {
+    appUpdateError.set(error instanceof Error ? error.message : String(error));
+    appUpdateStatus.set("error");
+  }
+}
+
+function renderAppUpdate() {
+  const status = appUpdateStatus();
+  const info = appUpdateInfo();
+  const statusLabels: Record<AppUpdateStatus, string> = {
+    idle: tt("appUpdate.idle", "未检查"),
+    checking: tt("appUpdate.checking", "检查中"),
+    current: tt("appUpdate.current", "已是最新"),
+    available: tt("appUpdate.available", "发现新版本"),
+    downloading: tt("appUpdate.downloading", "下载中"),
+    installing: tt("appUpdate.installing", "安装中,完成后将重启"),
+    error: tt("appUpdate.error", "检查失败"),
+  };
+  const busy = status === "checking" || status === "downloading" || status === "installing";
+  const primaryLabel =
+    status === "idle" || status === "error"
+      ? tt("appUpdate.check", "检查更新")
+      : status === "current"
+        ? tt("appUpdate.recheck", "重新检查")
+        : status === "available"
+          ? tt("appUpdate.install", "下载并安装后重启")
+          : t("common.loading");
+  return (
+    <View style={{ gap: 20 }}>
+      {renderSectionHeader(tt("settings.tabs.appUpdate", "应用更新"), tt("settings.appUpdateHint", "检查 SkillMate 新版本;更新包经签名校验,安装后自动重启。"))}
+      <View style={{ height: 1, backgroundColor: token("border") }} />
+      <View style={{ gap: 10, maxWidth: 520 }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+          <Text
+            style={{
+              color:
+                status === "available"
+                  ? toneColor(skin(), "warn", mode())
+                  : status === "error"
+                    ? toneColor(skin(), "error", mode())
+                    : token("muted-foreground"),
+              fontSize: 13,
+              fontWeight: "650",
+            }}
+          >
+            {statusLabels[status]}
+          </Text>
+          {status === "available" && info ? (
+            <Text style={{ color: token("foreground"), fontSize: 13 }}>{`v${info.version}`}</Text>
+          ) : null}
+          {status === "downloading" && appUpdateProgress() ? (
+            <Text class="text-muted-foreground" style={{ fontSize: 12 }}>{appUpdateProgress()}</Text>
+          ) : null}
+        </View>
+        {status === "available" && info?.notes ? (
+          <Text class="text-muted-foreground" style={{ fontSize: 12 }}>{String(info.notes).slice(0, 300)}</Text>
+        ) : null}
+        {appUpdateError() ? (
+          <Text style={{ color: toneColor(skin(), "error", mode()), fontSize: 11 }}>{appUpdateError()}</Text>
+        ) : null}
+        {primaryLabel !== t("common.loading") || busy ? (
+          <View style={{ flexDirection: "row", gap: 8 }}>
+            {status === "available" && info?.canInstall ? (
+              primaryButton(tt("appUpdate.install", "下载并安装后重启"), () => void downloadAndInstallAppUpdate())
+            ) : (
+              primaryButton(primaryLabel, () => void checkAppUpdate(), false, busy)
+            )}
+          </View>
+        ) : null}
+        <Text class="text-muted-foreground" style={{ fontSize: 11 }}>
+          {tt("appUpdate.devNote", "开发运行与无 updater 配置的包不提供更新检查。")}
+        </Text>
+      </View>
+    </View>
+  );
+}
 
 declare global {
   // eslint-disable-next-line no-var
@@ -274,6 +391,7 @@ function renderSettingsNav() {
       label: tt("settings.group.app", "应用"),
       items: [
         { id: "backup", labelKey: "settings.tabs.backup", icon: "branch" },
+        { id: "appUpdate", labelKey: "settings.tabs.appUpdate", icon: "updates" },
         { id: "policy", labelKey: "settings.tabs.installPolicy", icon: "shield" },
         { id: "libraryRoot", labelKey: "settings.tabs.library", icon: "folder" },
       ],
@@ -445,7 +563,7 @@ function fieldInput(value: string, onChange: (value: string) => void, placeholde
   );
 }
 
-function primaryButton(label: string, onPress: () => void, danger = false) {
+function primaryButton(label: string, onPress: () => void, danger = false, disabled = false) {
   return (
     <View
       role="button"
@@ -760,6 +878,7 @@ function renderSettings() {
         {current === "language" ? renderLanguage() : null}
         {current === "appearance" ? renderAppearance() : null}
         {current === "backup" ? renderBackup() : null}
+        {current === "appUpdate" ? renderAppUpdate() : null}
         {current === "policy" ? renderPolicy() : null}
         {current === "libraryRoot" ? renderLibraryRoot() : null}
         {current === "data" ? renderData() : null}

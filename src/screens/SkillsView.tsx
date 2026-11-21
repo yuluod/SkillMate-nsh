@@ -7,7 +7,7 @@ import { Stamp } from "../components/Stamp";
 import { Icon } from "../components/Icon";
 import { skinStyle, toneColor } from "../theme";
 import {
-  dashboard, detail, detailLoading, filter, mode, openDetail, query, refresh, scenarios, selectedIdentity,
+  dashboard, detail, detailLoading, filter, focusSearch, ignoredPaths, mode, openDetail, query, refresh, scenarios, selectedIdentity,
   skin, tags, type SkillFilter,
 } from "../state";
 import {
@@ -16,8 +16,9 @@ import {
 } from "../lib/inventory";
 import { api } from "../lib/api";
 import {
-  openAdoptFlow, openInstallFlow, openMarket, openScenarioCreate, openTagEditor, openTagManager,
-  openUpdatePreview, requestConfirm, showUndoBar, showToast, tt,
+  filterByIgnored, openAdoptFlow, openInstallFlow, openMarket, openRollbackPreview,
+  openScenarioCreate, openTagEditor, openTagManager, openTemplateCreate, openUpdatePreview,
+  requestConfirm, showIgnoredOnly, showUndoBar, showToast, toggleIgnoreConfirm, toggleShowIgnored, tt,
 } from "../flows";
 
 const FILTERS: { id: SkillFilter; labelKey: string }[] = [
@@ -49,7 +50,7 @@ function visibleRows() {
   const needle = query();
   const activeScenario = scenarios().find((item: Record<string, any>) => item.id === scenarioFilter());
   const allowedPaths = activeScenario ? new Set<string>(activeScenario.skill_ids ?? []) : null;
-  const filtered = rows.filter((row) => {
+  const filtered = filterByIgnored(rows.filter((row) => {
     if (filter() === "notEnabled" && (row.deployments?.length ?? 0) > 0) return false;
     if (filter() === "updates" && !row.has_update && row.sync_state !== "behind") return false;
     if (filter() === "needsAttention" && !buildSkillCardView(row, t).needsAttention) return false;
@@ -59,7 +60,7 @@ function visibleRows() {
       if (!identities.some((identity) => identity && allowedPaths.has(identity))) return false;
     }
     return skillMatchesQuery(row, needle, bodyHits());
-  });
+  }), ignoredPaths());
   if (sortMode() === "name") {
     filtered.sort((left, right) => String(left.name || "").localeCompare(String(right.name || "")));
   } else {
@@ -120,6 +121,7 @@ function renderHeaderActions() {
   const actions = [
     { id: "header-add", label: tt("install.title.add", "添加 Skill"), primary: true, onPress: () => openInstallFlow("add") },
     { id: "header-adopt", label: tt("adopt.title", "接管"), primary: false, onPress: () => openAdoptFlow() },
+    { id: "header-template", label: tt("template.title", "模板创建"), primary: false, onPress: () => openTemplateCreate() },
     { id: "header-market", label: tt("market.title", "发现"), primary: false, onPress: () => openMarket() },
     { id: "header-tags", label: tt("tags.title", "标签"), primary: false, onPress: () => openTagManager() },
   ];
@@ -400,6 +402,20 @@ function renderDetailActions(row: Record<string, any>) {
     }
   }
   buttons.push({ label: tt("trash.confirm", "移除"), danger: true, onPress: () => trashSkillRow(row.path, name) });
+  if (!row.in_library) {
+    const ignored = ignoredPaths().has(String(row.path));
+    buttons.push({
+      label: ignored ? tt("skills.unignoreTitle", "取消忽略") : tt("skills.ignoreTitle", "忽略"),
+      danger: false,
+      onPress: () => toggleIgnoreConfirm(String(row.path), name, ignored),
+    });
+  }
+  if (sync?.hasUpdate || sync?.canSync) {
+    buttons.push({
+      label: tt("rollback.title", "回滚上一版本"),
+      onPress: () => void openRollbackPreview(String(row.path), name),
+    });
+  }
   if (row.in_library || row.source_type === "deployment") {
     buttons.push({
       label: t("skills.openFolder", { name }),
@@ -455,6 +471,7 @@ function renderSkills() {
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
         <Icon name="search" size={14} />
         <Input
+          autoFocus={focusSearch()}
           value={query()}
           onChange={({ value }: { value: string }) => {
             query.set(value);
@@ -506,6 +523,15 @@ function renderSkills() {
           style={{ color: sortMode() === "updates" ? token("primary") : token("muted-foreground"), fontSize: 13, fontWeight: sortMode() === "updates" ? "650" : "400" }}
         >
           {tt("sort.updates", "有更新优先")}
+        </Text>
+        <View style={{ width: 1, height: 14, backgroundColor: token("border") }} />
+        <Text
+          role="button"
+          accessibilityLabel={showIgnoredOnly() ? tt("skills.showAll", "全部条目") : tt("skills.showIgnored", "已忽略")}
+          onPress={() => toggleShowIgnored()}
+          style={{ color: showIgnoredOnly() ? token("primary") : token("muted-foreground"), fontSize: 13, fontWeight: showIgnoredOnly() ? "650" : "400" }}
+        >
+          {showIgnoredOnly() ? tt("skills.showAll", "全部条目") : tt("skills.showIgnored", "已忽略")}
         </Text>
       </View>
       {tags().length > 0 ? (

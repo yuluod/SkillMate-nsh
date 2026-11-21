@@ -8,13 +8,16 @@ import { mode, skin } from "../state";
 import { Icon } from "./Icon";
 import {
   adoptApplying, adoptAssistant, adoptError, adoptOpen, adoptPath, adoptPreview, adoptPreviewing,
-  applyDriftSync, applyTagsToSelection, applyUpdate, tt, closeInstallFlow, confirmBusy, confirmState,
-  createScenarioNow, createTag, deleteTagConfirm, driftApplying, driftState, installApplying,
+  applyDriftSync, applyRollback, applyTagsToSelection, applyUpdate, tt, closeInstallFlow,
+  confirmBusy, confirmState, createScenarioNow, createTag, createTemplateSkill, deleteTagConfirm,
+  driftApplying, driftState, installApplying,
   installContext, installError, installOpen, installPreview, installPreviewing, installMarketItem,
   marketError, marketItems, marketLoading, marketOpen, marketQuery, openScenarioCreate,
-  runAdoptApply, runAdoptPreview, runInstallApply, runInstallPreview, runMarketSearch,
+  rollbackApplying, rollbackState, runAdoptApply, runAdoptPreview, runInstallApply, runInstallPreview,
+  runMarketSearch,
   scenarioCreateOpen, scenarioBusy, scenarioDescDraft, scenarioNameDraft, scenarioSelected,
   settleConfirm, TAG_COLORS, tagBusy, tagColorDraft, tagEditorBusy, tagEditorOpen, tagEditorSelection,
+  templateBusy, templateDescDraft, templateErrors, templateNameDraft, templateOpen,
   tagNameDraft, tagManagerOpen, toast, undoBar, undoTrash, updateApplying, updatePreviewState,
 } from "../flows";
 import { tags } from "../state";
@@ -513,6 +516,97 @@ function renderTagEditorModal() {
   );
 }
 
+function renderTemplateModal() {
+  if (!templateOpen()) return null;
+  const errors = templateErrors();
+  return sheet(
+    <View style={{ gap: 12 }}>
+      <Text style={{ color: token("foreground"), fontSize: 15, fontWeight: "650" }}>{tt("template.title", "从模板创建 Skill")}</Text>
+      <View style={{ gap: 4 }}>
+        <Text class="text-muted-foreground" style={{ fontSize: 11 }}>{tt("template.name", "名称(目录名)")}</Text>
+        <Input
+          value={templateNameDraft()}
+          onChange={({ value }: { value: string }) => templateNameDraft.set(value)}
+          placeholder="my-skill"
+          style={{ backgroundColor: token("background"), color: token("foreground"), borderWidth: skinStyle(skin()).borderWidth, borderColor: token("border"), borderRadius: skinStyle(skin()).radius, paddingHorizontal: 10, paddingVertical: 7, fontSize: 12 }}
+        />
+      </View>
+      <View style={{ gap: 4 }}>
+        <Text class="text-muted-foreground" style={{ fontSize: 11 }}>{t("common.details")}</Text>
+        <Input
+          value={templateDescDraft()}
+          onChange={({ value }: { value: string }) => templateDescDraft.set(value)}
+          placeholder={tt("template.descPlaceholder", "这个 Skill 做什么(可选)")}
+          style={{ backgroundColor: token("background"), color: token("foreground"), borderWidth: skinStyle(skin()).borderWidth, borderColor: token("border"), borderRadius: skinStyle(skin()).radius, paddingHorizontal: 10, paddingVertical: 7, fontSize: 12 }}
+        />
+      </View>
+      {errors.length > 0 ? (
+        <View style={{ gap: 2 }}>
+          {errors.map((error) => (
+            <Text style={{ color: toneColor(skin(), "error", mode()), fontSize: 11 }}>{error}</Text>
+          ))}
+        </View>
+      ) : null}
+      <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 8 }}>
+        <View role="button" accessibilityLabel={t("common.cancel")} onPress={() => templateOpen.set(false)} style={{ paddingHorizontal: 14, paddingVertical: 7, borderWidth: skinStyle(skin()).borderWidth, borderColor: token("border"), borderRadius: skinStyle(skin()).radius }}>
+          <Text style={{ color: token("muted-foreground"), fontSize: 13 }}>{t("common.cancel")}</Text>
+        </View>
+        <View
+          role="button"
+          accessibilityLabel={tt("template.create", "创建并入库")}
+          onPress={() => void createTemplateSkill()}
+          style={{ paddingHorizontal: 14, paddingVertical: 7, backgroundColor: token("primary"), borderRadius: skinStyle(skin()).radius }}
+        >
+          <Text style={{ color: token("primary-foreground"), fontSize: 13, fontWeight: "600" }}>
+            {templateBusy() ? t("common.loading") : tt("template.create", "创建并入库")}
+          </Text>
+        </View>
+      </View>
+    </View>,
+  );
+}
+
+function renderRollbackModal() {
+  const state = rollbackState();
+  if (!state) return null;
+  const preview = state.preview;
+  return sheet(
+    <View style={{ gap: 12 }}>
+      <Text style={{ color: token("foreground"), fontSize: 15, fontWeight: "650" }}>{tt("rollback.title", "回滚上一版本")}</Text>
+      <Text style={{ color: preview.canApply ? token("foreground") : toneColor(skin(), "warn", mode()), fontSize: 12 }}>
+        {preview.blockedReason || `${preview.installedRef} → ${preview.latestRef}`}
+      </Text>
+      <View style={{ gap: 2 }}>
+        {preview.impacts.map((impact) => (
+          <Text class="text-muted-foreground" style={{ fontSize: 11 }}>
+            {`${impact.assistant} · ${impact.scope}${impact.projectPath ? ` · ${impact.projectPath}` : ""}`}
+          </Text>
+        ))}
+        {preview.files.slice(0, 10).map((file) => (
+          <Text class="text-muted-foreground" style={{ fontSize: 11 }}>
+            {`${file.kind} · ${file.path}`}
+          </Text>
+        ))}
+      </View>
+      <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 8 }}>
+        <View role="button" accessibilityLabel={t("common.cancel")} onPress={() => rollbackState.set(null)} style={{ paddingHorizontal: 14, paddingVertical: 7, borderWidth: skinStyle(skin()).borderWidth, borderColor: token("border"), borderRadius: skinStyle(skin()).radius }}>
+          <Text style={{ color: token("muted-foreground"), fontSize: 13 }}>{t("common.cancel")}</Text>
+        </View>
+        <View
+          role="button"
+          accessibilityLabel={tt("rollback.apply", "执行回滚")}
+          onPress={() => void applyRollback()}
+          style={{ paddingHorizontal: 14, paddingVertical: 7, backgroundColor: toneColor(skin(), "warn", mode()), borderRadius: skinStyle(skin()).radius }}
+        >
+          <Text style={{ color: token("primary-foreground"), fontSize: 13, fontWeight: "600" }}>
+            {rollbackApplying() ? t("common.loading") : tt("rollback.apply", "执行回滚")}
+          </Text>
+        </View>
+      </View>
+    </View>,
+  );
+}
+
 function renderDriftModal() {
   const state = driftState();
   if (!state) return null;
@@ -632,6 +726,8 @@ export function Overlays() {
       {renderMarketModal()}
       {renderTagEditorModal()}
       {renderDriftModal()}
+      {renderTemplateModal()}
+      {renderRollbackModal()}
     </>
   );
 }
