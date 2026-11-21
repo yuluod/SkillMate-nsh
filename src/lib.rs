@@ -593,6 +593,84 @@ impl Library {
         })
     }
 
+
+    // ---- v0.1.2 新增:模板创建 / 忽略标记 / 更新快照回滚 ----
+    /// 校验模板草稿(JSON SkillDraftValidation)。
+    pub async fn validateSkillDraft(name: String, description: String) -> Result<String, String> {
+        sm::operation_coordinator::run_readonly_operation(|db| {
+            json_string(&sm::skill_template::validate_skill_draft(db, &name, &description))
+        })
+    }
+
+    /// 从模板创建新 Skill 并入库(返回路径)。
+    pub async fn createLibrarySkill(
+        name: String,
+        description: String,
+        locale: Option<String>,
+    ) -> Result<String, String> {
+        sm::operation_coordinator::run_exclusive_operation(|db| {
+            let path = sm::skill_template::create_library_skill(
+                db,
+                &name,
+                &description,
+                locale.as_deref().unwrap_or("zh-CN"),
+            )?;
+            Ok(path.to_string_lossy().to_string())
+        })
+    }
+
+    /// 标记/取消忽略外部条目。
+    pub async fn setSkillIgnore(skill_path: String, ignored: bool) -> Result<String, String> {
+        sm::operation_coordinator::run_exclusive_operation(|db| {
+            sm::organization_commands::set_skill_ignore_in_db(
+                db,
+                std::path::Path::new(skill_path.trim()),
+                ignored,
+            )
+        })
+    }
+
+    /// 已忽略路径清单。
+    pub async fn listIgnoredSkills() -> Result<Vec<String>, String> {
+        sm::operation_coordinator::run_readonly_operation(|db| {
+            sm::organization_commands::list_ignored_skills_from_db(db)
+        })
+    }
+
+    /// 更新快照清单(JSON Vec<SkillSnapshot>)。
+    pub async fn listSkillSnapshots(path: String) -> Result<String, String> {
+        sm::operation_coordinator::run_exclusive_operation(|db| {
+            let library_path =
+                sm::skill_library::resolve_library_path(db, &sm::app_core::expand_path(path.trim()))?;
+            json_string(&sm::skill_snapshot::list_snapshots(db, &library_path)?)
+        })
+    }
+
+    /// 回滚预览(JSON UpdatePreview,camelCase)。
+    pub async fn previewSkillRollback(path: String) -> Result<String, String> {
+        sm::operation_coordinator::run_exclusive_operation(|db| {
+            json_string(&sm::update_preview::preview_skill_rollback(
+                db,
+                &sm::app_core::expand_path(path.trim()),
+            )?)
+        })
+    }
+
+    /// 执行回滚(plan_token 两段式)。
+    pub async fn applySkillRollback(path: String, plan_token: Option<String>) -> Result<String, String> {
+        sm::operation_coordinator::run_exclusive_operation(|db| {
+            let p = sm::app_core::expand_path(path.trim());
+            let library_path = sm::skill_library::resolve_library_path(db, &p)?;
+            if !sm::operation_coordinator::is_known_skill_path(db, &p)?
+                && !sm::operation_coordinator::is_known_skill_path(db, &library_path)?
+            {
+                return Err("只允许回滚已发现或受管的 Skill".to_string());
+            }
+            sm::update_preview::apply_skill_rollback(db, &p, plan_token.as_deref())
+        })
+    }
+
+    // ---- 组织:标签/场景 ----
     // ---- 组织:标签/场景 ----
     /// 新增标签。
     pub async fn addTag(name: String, color: String) -> Result<String, String> {

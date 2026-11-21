@@ -183,6 +183,20 @@ export const api = {
     Library.setupGitBackup(repoPath, remoteUrl, branch),
   syncToGit: (message: string) => Library.syncToGit(message),
   searchSkillBodiesRaw: (paths: string[], query: string) => Library.searchSkillBodies(paths, query),
+  // ---- v0.1.2:模板创建 / 忽略标记 / 更新快照回滚 ----
+  validateSkillDraft: (name: string, description: string) =>
+    parse<{ ok: boolean; errors: string[] }>(Library.validateSkillDraft(name, description)),
+  createLibrarySkill: (name: string, description: string, locale?: string) =>
+    Library.createLibrarySkill(name, description, locale ?? null),
+  setSkillIgnore: (skillPath: string, ignored: boolean) => Library.setSkillIgnore(skillPath, ignored),
+  listIgnoredSkills: () => Library.listIgnoredSkills(),
+  listSkillSnapshots: (path: string) =>
+    parse<{ snapshot_dir: string; ref: string; content_hash: string; created_at: number }[]>(
+      Library.listSkillSnapshots(path),
+    ),
+  previewSkillRollback: (path: string) => parse<UpdatePreview>(Library.previewSkillRollback(path)),
+  applySkillRollback: (path: string, planToken?: string) =>
+    Library.applySkillRollback(path, planToken ?? null),
   rawGetScenarios: () => Library.getScenarios(),
   previewSyncSkillCopiesTyped: (sourcePath: string, targetPaths: string[]) =>
     parse<{
