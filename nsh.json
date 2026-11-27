@@ -1,13 +1,16 @@
 {
   "name": "SkillMate",
   "id": "io.github.yuluod.skillmate.nsh",
-  "version": "0.1.0",
-  "build": 1,
+  "version": "0.1.1",
+  "build": 2,
   "rust": ".",
   "theme": "theme-ledger.json",
   "icon": { "windows": "app-icon.png" },
   "singleInstance": true,
-  "updater": { "github": "yuluod/SkillMate-nsh" },
+  "updater": {
+    "github": "yuluod/SkillMate-nsh",
+    "publicKey": "FPDtIr1YvnuqJ4W+7Cuyq0G5xob2oO5isYZ9kP218GY="
+  },
   "locales": ["zh-CN", "en"],
   "window": {
     "defaultSize": { "width": 1000, "height": 700 },
